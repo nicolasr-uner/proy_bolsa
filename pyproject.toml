@@ -31,11 +31,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Fuentes adicionales: se anaden a core tras validarlas en la Fase 2.
-sources = [
-  "sdmx1>=2.13",          # Banco de la Republica (SDMX) para TRM / IPP
-  "pandas-datareader>=0.10",  # FRED: Brent, PPI EE.UU.
-]
+# Las fuentes externas (FRED, datos.gov.co) se consumen con requests + pandas
+# (core), sin dependencias extra. pandas-datareader se descarto: rompe en
+# Python 3.12 al importar distutils (eliminado del stdlib).
 dev = ["pytest==9.1.0", "ruff>=0.6"]
 viz = ["streamlit>=1.36"]
 track = ["mlflow>=2.14"]

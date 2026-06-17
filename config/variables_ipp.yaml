@@ -1,34 +1,41 @@
 # Diccionario de variables y supuestos: modelo de IPP.
-# Estado inicial (Fase 0). Las fuentes se validan en la Fase 2.
+# [CONFIRMADO] = fuente verificada con consulta real (junio 2026).
+# Las fuentes externas se consumen con requests + pandas (REST), sin libs extra.
 
 objetivo:
   ipp:
     descripcion: Indice de Precios del Productor - Oferta Interna
-    fuente: DANE (oficial) / Banco de la Republica (SUAMECA, SDMX)
+    fuente: DANE (oficial); alternativa Banco de la Republica
     granularidad: mensual
     base: dic-2014 = 100
     transformacion: "variacion mensual (log-dif); modelar nivel o variacion"
     confianza: alta
+    estado: "[POR VALIDAR Fase 2] DANE no tiene API REST limpia; explorar datos.gov.co / boletines / SDMX BanRep"
     nota: "DANE publica un dato PROVISIONAL y lo revisa el mes siguiente -> el loop debe re-incorporar la version definitiva."
 
 drivers:
   trm:
     descripcion: Tasa de cambio representativa del mercado (USD/COP)
-    fuente: Banco de la Republica (SDMX) / SUAMECA
+    fuente: datos.gov.co (Socrata)
+    dataset_id: "32sa-8pi3"          # [CONFIRMADO] campos: valor, unidad, vigenciadesde, vigenciahasta
+    acceso: "https://www.datos.gov.co/resource/32sa-8pi3.json"
     granularidad: diaria -> promedio mensual
     unidad: COP/USD
     transformacion: "variacion mensual; rezagos 0-2 meses"
     confianza: alta
   brent:
     descripcion: Precio internacional del petroleo (Brent)
-    fuente: FRED / EIA
+    fuente: FRED (descarga CSV directa)
+    serie_id: "DCOILBRENTEU"         # [CONFIRMADO] diaria, USD/barril
+    acceso: "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILBRENTEU"
     granularidad: diaria -> promedio mensual
-    unidad: USD/barril
     transformacion: "variacion mensual; rezagos 0-2 meses"
     confianza: alta
   ppi_usa:
     descripcion: Producer Price Index de EE.UU. (transmision internacional)
-    fuente: FRED (BLS)
+    fuente: FRED (descarga CSV directa)
+    serie_id: "PPIACO"               # [CONFIRMADO] mensual
+    acceso: "https://fred.stlouisfed.org/graph/fredgraph.csv?id=PPIACO"
     granularidad: mensual
     confianza: media
 

@@ -22,12 +22,16 @@ mapean en la Fase 2 contra el catálogo (`scripts/check_pydataxm.py`).
 
 | Fuente | Qué aporta | Acceso | Estado |
 |---|---|---|---|
-| **DANE** | IPP oficial mensual (base dic-2014), desagregado por destino y CIIU | Banco de datos / boletines | Por validar |
-| **Banco de la República (SUAMECA)** | IPP, TRM y series macro | SDMX / Excel | Por validar |
-| FRED / EIA | Brent, PPI EE.UU. | `pandas-datareader` / API | Por validar |
+| **DANE** | IPP oficial mensual (base dic-2014), desagregado por destino y CIIU | Banco de datos / boletines (sin API REST limpia) | **Por validar (Fase 2)** |
+| **TRM** | Tasa de cambio USD/COP | datos.gov.co Socrata `32sa-8pi3` | **Validado** |
+| **FRED — Brent** | Petróleo Brent (USD/bbl) | CSV directo `fredgraph.csv?id=DCOILBRENTEU` | **Validado** |
+| **FRED — PPI EE.UU.** | PPI all commodities | CSV directo `fredgraph.csv?id=PPIACO` | **Validado** |
 
 Nota: DANE publica el IPP **provisional** y lo revisa al mes siguiente; el loop
 mensual debe re-incorporar la versión definitiva como nueva información.
+
+`pandas-datareader` se descartó (rompe en Python 3.12 por `distutils`); las
+fuentes externas se consumen con `requests`/`pandas` directos.
 
 ## Hallazgos técnicos de la validación (Fase 0/1)
 
