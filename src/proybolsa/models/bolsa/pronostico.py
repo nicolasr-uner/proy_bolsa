@@ -146,7 +146,7 @@ class PronosticadorBolsa:
             "Ajustando ensemble: %d dias train, %d dias val (%.0f%%)",
             len(df_train), len(df_val), val_fraccion * 100,
         )
-        self.modelo.fit(df_train, df_val=df_val)
+        self.modelo.fit(df_train, df_val=df_val, df_full=df)
         return self
 
     def pronosticar(

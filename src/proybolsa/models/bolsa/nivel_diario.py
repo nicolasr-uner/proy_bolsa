@@ -255,13 +255,28 @@ class EnsembleNivel:
     # y puede cambiar entre entrenamiento y despliegue (El Nino vs post-El Nino).
     sesgo_por_horizonte: dict = field(default_factory=dict)
 
-    def fit(self, df_train: pd.DataFrame, df_val: pd.DataFrame | None = None) -> "EnsembleNivel":
-        """Ajusta ambos modelos y calibra pesos si se pasa df_val."""
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        df_val: pd.DataFrame | None = None,
+        df_full: pd.DataFrame | None = None,
+    ) -> "EnsembleNivel":
+        """Ajusta ambos modelos y calibra pesos si se pasa df_val.
+
+        Si se pasa df_full, re-ajusta los componentes sobre toda la serie tras
+        calibrar pesos: el pronostico de produccion debe partir del ultimo dato
+        observado, no del fin de df_train. (En backtest no se pasa df_full, para
+        no contaminar el walk-forward.)
+        """
         self.sarimax.fit(df_train)
         self.lgb.fit(df_train)
 
         if df_val is not None and len(df_val) > 0:
             self._calibrar_pesos(df_val)
+
+        if df_full is not None and len(df_full) > len(df_train):
+            self.sarimax.fit(df_full)
+            self.lgb.fit(df_full)
         return self
 
     def actualizar_sesgo(self, sesgo: dict) -> None:

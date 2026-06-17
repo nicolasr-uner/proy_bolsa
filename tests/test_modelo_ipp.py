@@ -239,3 +239,15 @@ class TestPronosticadorIPP:
         df = _df_ipp_sintetico(60).drop(columns=["ipp"])
         with pytest.raises(ValueError, match="ipp"):
             PronosticadorIPP().fit(df)
+
+    def test_componentes_reajustados_sobre_serie_completa(self):
+        """El forecast de produccion debe usar componentes ajustados sobre TODA la
+        serie, no solo sobre df_train (que excluye los meses recientes para calibrar
+        pesos). Bug historico: SARIMA/SARIMAX se ajustaban hasta el fin de df_train,
+        dejando el pronostico stale ~N meses y desanclado del ultimo dato real."""
+        df = _df_ipp_sintetico(60)
+        p = PronosticadorIPP()
+        p.fit(df)
+        n_full = len(df.dropna(subset=["ipp"]))
+        assert int(p.modelo.sarima._result.nobs) == n_full
+        assert int(p.modelo.sarimax._result.nobs) == n_full

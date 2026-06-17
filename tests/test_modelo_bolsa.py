@@ -237,3 +237,9 @@ class TestPronosticadorBolsa:
     def test_escenarios_dict_keys(self, modelo_ajustado):
         esc = modelo_ajustado.pronosticar(7, escenarios_multiples=True, devolver_horario=False)
         assert set(esc.keys()) == {"seco", "promedio", "humedo"}
+
+    def test_componentes_reajustados_sobre_serie_completa(self, modelo_ajustado):
+        """El SARIMAX de produccion debe ajustarse sobre TODA la serie, no solo
+        df_train. df_val solo calibra pesos; el forecast debe partir del ultimo dato."""
+        n_full = len(_df_diario_sintetico(400))
+        assert int(modelo_ajustado.modelo.sarimax._result.nobs) == n_full

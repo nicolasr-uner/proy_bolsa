@@ -330,7 +330,19 @@ class EnsembleIPP:
     w_lgb: float = 0.25
     sesgo_por_horizonte: dict = field(default_factory=dict)
 
-    def fit(self, df_train: pd.DataFrame, df_val: pd.DataFrame | None = None) -> "EnsembleIPP":
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        df_val: pd.DataFrame | None = None,
+        df_full: pd.DataFrame | None = None,
+    ) -> "EnsembleIPP":
+        """Ajusta los 4 componentes y calibra pesos.
+
+        Los componentes se ajustan sobre df_train y los pesos se calibran sobre df_val
+        (validacion honesta). Si se pasa df_full, los componentes se RE-AJUSTAN sobre
+        toda la serie para el pronostico de produccion: de lo contrario el forecast
+        partiria del fin de df_train (stale) en vez del ultimo dato observado.
+        """
         logger.info("Ajustando SARIMA IPP...")
         self.sarima.fit(df_train)
         logger.info("Ajustando SARIMAX IPP...")
@@ -344,6 +356,14 @@ class EnsembleIPP:
             self._calibrar_pesos(df_val)
         else:
             self._normalizar_pesos()
+
+        # Re-ajuste sobre la serie completa (pesos ya calibrados se conservan).
+        if df_full is not None and len(df_full) > len(df_train):
+            logger.info("Re-ajustando componentes IPP sobre la serie completa (%d obs)...", len(df_full))
+            self.sarima.fit(df_full)
+            self.sarimax.fit(df_full)
+            self.vecm.fit(df_full)
+            self.lgb.fit(df_full)
         return self
 
     def _normalizar_pesos(self) -> None:
@@ -464,7 +484,7 @@ class PronosticadorIPP:
         df_train = df.iloc[:-n_val]
         df_val   = df.iloc[-n_val:]
         logger.info("IPP: %d meses train, %d meses val", len(df_train), len(df_val))
-        self.modelo.fit(df_train, df_val=df_val)
+        self.modelo.fit(df_train, df_val=df_val, df_full=df)
         return self
 
     def pronosticar(
