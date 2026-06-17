@@ -26,7 +26,8 @@ drivers:
     descripcion: Aportes hidricos como % de la media historica (normalizado)
     metric_id: PorcApor              # [CONFIRMADO] Sistema, %, diaria
     entidad: Sistema
-    unidad: "%"
+    unidad: "fraccion (0-1); 0.73 = 73% de la media historica"
+    nota_api: "XM devuelve fraccion decimal, NO porcentaje. Multiplicar x100 en feature engineering."
     rol: "driver Tier 1; mejor que el valor absoluto"
     confianza: alta
   aportes_energia:
@@ -42,7 +43,8 @@ drivers:
     descripcion: Nivel de embalse (volumen util) como % de la capacidad
     metric_id: PorcVoluUtilDiar      # [CONFIRMADO] Sistema, %, diaria
     entidad: Sistema
-    unidad: "%"
+    unidad: "fraccion (0-1); 0.69 = 69% de la capacidad util"
+    nota_api: "XM devuelve fraccion decimal. Multiplicar x100 en feature engineering."
     rol: "driver Tier 1 (energia almacenada)"
     confianza: alta
   volumen_util_energia:
