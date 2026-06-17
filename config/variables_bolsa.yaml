@@ -1,71 +1,101 @@
 # Diccionario de variables y supuestos: modelo de PRECIO DE BOLSA.
-# Estado: las metricas de XM marcadas [VALIDADO] se confirmaron con una consulta
-# real (junio 2026). Las marcadas [POR CONFIRMAR] se mapearan en la Fase 2 contra
-# el catalogo de 193 metricas de la API (ver scripts/check_pydataxm.py).
+# [CONFIRMADO] = metric_id verificado contra el catalogo real de XM (193 metricas,
+# ver docs/catalogo_xm.csv y scripts/catalogo_xm.py). Granularidad y unidad segun
+# catalogo. ENSO y combustibles se validan en Fase 2.
 
 objetivo:
   precio_bolsa:
     descripcion: Precio de Bolsa Nacional (horario)
     fuente: XM API (pydataxm)
-    metric_id: PrecBolsNaci          # [VALIDADO]
+    metric_id: PrecBolsNaci          # [CONFIRMADO]
     entidad: Sistema
     granularidad: horaria
     unidad: COP/kWh
     transformacion: "ancho 24h -> serie horaria larga; log(precio) para modelar el nivel"
     confianza: alta
 
+# Mapeo con el modelo R original (Proyecciones_Bolsa_Energia.rmd):
+#   v_max_t (vol max tecnico) -> CapaUtilDiarEner / VoluUtilDiarEner
+#   moi     (aportes)         -> AporEner / PorcApor
+#   mos     (oferta/gen)      -> Gene
+#   vertimientos             -> VertEner
+
 drivers:
+  # --- Hidrologia (Tier 1) ---
+  aportes_pct:
+    descripcion: Aportes hidricos como % de la media historica (normalizado)
+    metric_id: PorcApor              # [CONFIRMADO] Sistema, %, diaria
+    entidad: Sistema
+    unidad: "%"
+    rol: "driver Tier 1; mejor que el valor absoluto"
+    confianza: alta
+  aportes_energia:
+    metric_id: AporEner              # [CONFIRMADO] Sistema, kWh, diaria
+    entidad: Sistema
+    unidad: kWh
+  aportes_media_hist:
+    metric_id: AporEnerMediHist      # [CONFIRMADO] para construir ratios
+    entidad: Sistema
+    unidad: kWh
+  # --- Embalses (Tier 1) ---
+  volumen_util_pct:
+    descripcion: Nivel de embalse (volumen util) como % de la capacidad
+    metric_id: PorcVoluUtilDiar      # [CONFIRMADO] Sistema, %, diaria
+    entidad: Sistema
+    unidad: "%"
+    rol: "driver Tier 1 (energia almacenada)"
+    confianza: alta
+  volumen_util_energia:
+    metric_id: VoluUtilDiarEner      # [CONFIRMADO] Sistema/Embalse, kWh
+    entidad: Sistema
+  capacidad_util_energia:
+    metric_id: CapaUtilDiarEner      # [CONFIRMADO] Sistema/Embalse, kWh
+    entidad: Sistema
+  vertimientos:
+    descripcion: Vertimientos (energia no turbinada) -> 'vertimientos' del modelo R
+    metric_id: VertEner              # [CONFIRMADO] Embalse, kWh
+    entidad: Embalse
+  # --- Demanda (Tier 1) ---
+  demanda_real:
+    metric_id: DemaReal              # [CONFIRMADO] Sistema, kWh, horaria
+    entidad: Sistema
+    granularidad: horaria
+  demanda_comercial:
+    metric_id: DemaCome              # [CONFIRMADO] Sistema, kWh, horaria
+    entidad: Sistema
+    granularidad: horaria
+  demanda_sin:
+    metric_id: DemaSIN               # [CONFIRMADO] Sistema, kWh, diaria
+    entidad: Sistema
+  demanda_proyectada_upme:
+    descripcion: Proyeccion oficial de demanda (escenarios) -> clave horizonte largo/PPAs
+    metric_id: [EscDemUPMEAlto, EscDemUPMEMedio, EscDemUPMEBajo]  # [CONFIRMADO] mensual
+    entidad: Sistema
+    rol: "exogena futura conocida para horizonte 12-24m"
+  # --- Generacion ---
+  generacion_por_recurso:
+    descripcion: Generacion real por recurso (separar hidro/termica/solar/eolica)
+    metric_id: Gene                  # [CONFIRMADO] Recurso, kWh, horaria
+    entidad: Recurso
+  generacion_ideal:
+    metric_id: GeneIdea              # [CONFIRMADO] Sistema/Recurso, kWh, horaria
+    entidad: Sistema
+  # --- Precios estructurales ---
   precio_escasez:
     descripcion: Precio de escasez (techo regulatorio que ancla los picos)
-    fuente: XM API
-    metric_id: PrecEsca              # [VALIDADO]  ~861 COP/kWh en may-2026
+    metric_id: PrecEsca              # [CONFIRMADO] ~861 COP/kWh en may-2026
     entidad: Sistema
-    granularidad: diaria
-    unidad: COP/kWh
-    rol: techo / cota superior en el modelo de largo plazo
-    confianza: alta
+    rol: "cota superior en el modelo de largo plazo"
   precio_oferta_ideal:
-    descripcion: Precio de oferta del despacho ideal (senal estructural)
-    fuente: XM API
-    metric_id: PrecOferIdeal         # [VALIDADO en catalogo]
+    metric_id: PrecOferIdeal         # [CONFIRMADO] Recurso, diaria
     entidad: Recurso
-    granularidad: diaria
-    confianza: alta
-  aportes_hidricos:
-    descripcion: Aportes hidricos (energia), driver Tier 1 en mercado hidro
-    fuente: XM API
-    metric_id: (por confirmar)       # [POR CONFIRMAR] buscar "Aporte" en catalogo
-    granularidad: diaria
-    unidad: GWh / % del promedio historico
-    transformacion: "ratio aportes/media historica; rezagos 1,7,30"
-    confianza: alta
-  nivel_embalses:
-    descripcion: Volumen util diario de embalses (energia almacenada)
-    fuente: XM API
-    metric_id: (por confirmar)       # [POR CONFIRMAR] buscar "Volu" / "Embalse"
-    granularidad: diaria
-    unidad: GWh / % capacidad util
-    confianza: alta
-  demanda:
-    descripcion: Demanda comercial / del SIN
-    fuente: XM API
-    metric_id: (por confirmar)       # [POR CONFIRMAR] buscar "Dema"
-    granularidad: horaria
-    unidad: kWh
-    confianza: alta
-  generacion_por_recurso:
-    descripcion: Generacion real por tipo (hidro, termica, solar, eolica)
-    fuente: XM API
-    metric_id: (por confirmar)       # [POR CONFIRMAR] buscar "Gene"
-    granularidad: horaria
-    confianza: media
+  # --- Exogenas externas ---
   enso_oni:
     descripcion: Indice ONI (El Nino / La Nina); regimen hidrologico
     fuente: NOAA CPC / IDEAM
-    metric_id: n/a (descarga aparte)
     granularidad: mensual
     transformacion: "dummy regimen El Nino (ONI > 0.5); rezagos 1-3 meses"
-    confianza: media
+    confianza: media                 # [POR VALIDAR Fase 2]
   combustibles:
     descripcion: Precios de gas y carbon (costo marginal termico)
     fuente: carga semi-manual (sin API gratuita confiable)
@@ -77,3 +107,4 @@ supuestos_generales:
   - "El nivel diario de precio lo explican fundamentales (hidrologia, demanda, ENSO)."
   - "El perfil horario (forma 24h) es estable por tipo de dia (habil/sabado/domingo/festivo) y mes."
   - "El precio de escasez actua como cota superior estructural."
+  - "Los % (PorcApor, PorcVoluUtilDiar) se prefieren a los valores absolutos por estar normalizados."
