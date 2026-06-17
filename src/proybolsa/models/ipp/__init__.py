@@ -17,5 +17,5 @@ __all__ = [
     "SARIMAXDriversIPP",
     "VECMDriversIPP",
     "LGBDriversIPP",
-    "test_johansen",
+    "johansen_cointegracion",
 ]
