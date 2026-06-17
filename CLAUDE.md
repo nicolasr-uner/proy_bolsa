@@ -64,8 +64,15 @@ Esto hace automáticamente:
 ### 2. IPP (requiere carga manual de DANE)
 
 El IPP de DANE no tiene API pública estable. Pasos:
-1. Descargar la serie IPP mensual desde [dane.gov.co](https://www.dane.gov.co) → Economía → Precios → IPP
-2. Guardar como `data/raw/macro/ipp_manual.csv` con formato:
+1. Descargar el Excel histórico desde [dane.gov.co](https://www.dane.gov.co) → Economía → Precios → IPP
+   (archivo: `anex-IPP-historicos-{mes}{año}.xlsx`)
+2. Copiar el Excel a la raíz del proyecto y convertirlo:
+   ```powershell
+   .venv\Scripts\python scripts/parsear_ipp_dane.py anex-IPP-historicos-may2026.xlsx
+   ```
+   Esto genera `data/raw/macro/ipp_manual.csv` automáticamente.
+
+   Formato alternativo si se carga a mano:
    ```
    fecha,ipp
    2014-12-01,100.0
@@ -73,10 +80,13 @@ El IPP de DANE no tiene API pública estable. Pasos:
    ...
    ```
    (fecha = primer día del mes; base dic-2014=100)
-3. Ejecutar:
+3. Si los macros (TRM/Brent/PPI) no tienen historia suficiente, extender primero:
    ```powershell
-   .venv\Scripts\python scripts/construir_features.py
-   .venv\Scripts\python run_monthly_update.py --solo-ipp
+   .venv\Scripts\python scripts/descarga_historico.py --inicio 2015-01-01 --solo-macro --forzar
+   ```
+4. Ejecutar:
+   ```powershell
+   .venv\Scripts\python run_monthly_update.py --sin-descarga --solo-ipp
    ```
 
 ### 3. Verificar el dashboard
