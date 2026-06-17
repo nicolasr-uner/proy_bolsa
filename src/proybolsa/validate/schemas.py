@@ -26,7 +26,9 @@ PRECIO_BOLSA_HORARIO = pa.DataFrameSchema(
             float,
             checks=[
                 pa.Check.ge(0, error="precio_bolsa no puede ser negativo"),
-                pa.Check.le(1200, error="precio_bolsa supera el maximo esperado (1200 COP/kWh)"),
+                # El precio puede superar el precio de escasez (~906) durante crisis hidrologicas.
+                # El maximo historico registrado en el SIN supera 3000 COP/kWh en El Nino extremo.
+                pa.Check.le(4000, error="precio_bolsa supera el limite de 4000 COP/kWh (revisar datos)"),
             ],
             nullable=False,
             description="COP/kWh",
