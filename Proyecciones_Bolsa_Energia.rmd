@@ -1,0 +1,1074 @@
+---
+title: "Proyecciones_Bolsa_Energia"
+author: "Nicolas Roveda Salamanca"
+date: "20-08-2025"
+---
+
+
+```{r Instalar paquetes}
+# Instalar paquetes necesarios (solo si no los tienes)
+install.packages(c("readxl", "dplyr", "tidyverse", "forecast", "tseries",
+                   "xgboost", "lubridate", "ggplot2", "ggcorrplot",
+                   "sf", "lmtest", "car", "janitor", "rnaturalearth"))
+
+```
+
+```{r SECCIÓN 1: CARGAR LIBRERÍAS}
+
+library(readxl)           # Permite leer archivos de Excel (.xls y .xlsx)
+library(dplyr)            # Manipular datos (filtrar, seleccionar, agrupar, etc.)
+library(tidyverse)        # Colección de paquetes para ciencia de datos en R
+library(forecast)         # Modelar y pronosticar series temporales (ARIMA, ETS, etc.)
+library(tseries)          # Analizar series temporales y pruebas estadísticas (ADF, etc.)
+library(xgboost)          # Implementar algoritmos de gradient boosting para modelos predictivos
+library(lubridate)        # Facilita el trabajo con fechas y horas 
+library(ggplot2)          # Gráficos
+library(ggcorrplot)       # Graficar matrices de correlación de forma clara y estética
+library(sf)               # Manejo datos espaciales (shapefiles, etc.)
+library(lmtest)           # Pruebas estadísticas para modelos lineales (Breusch-Pagan, Durbin-Watson, etc.)
+library(car)              # Herramientas de regresión; incluye `vif()` para detectar multicolinealidad
+library(janitor)          # Limpieza de datos, especialmente nombres de columnas con `clean_names()`
+library(rnaturalearth)    # Permite descargar datos geográficos del Natural Earth
+
+devtools::install_github("ropensci/rnaturalearthhires")  # Instala versión con mayor resolución de mapas desde GitHub
+library(rnaturalearthhires)  # Accede a mapas de alta resolución de Natural Earth (uso con `sf`)
+
+
+
+```
+
+
+```{r SECCIÓN 2: CARGA Y PREPROCESAMIENTO DE DATOS}
+
+setwd("C:/Users/Lenovo/Downloads/Resultados Proy")
+
+# Define el nombre del archivo y las hojas (¡ajusta si es necesario!)
+excel_file <- "C:/Users/Lenovo/OneDrive/Desktop/Información Estimación precio bolsa.xlsx"
+
+# Cargar los datos desde Excel
+# Uso: read_excel() de la librería readxl
+df_hidrologia <- read_excel(excel_file, sheet = 1)
+df_hidrologia <- df_hidrologia[, -ncol(df_hidrologia)]
+
+
+df_h_x_embalse <- read_excel(excel_file, sheet = 2)
+df_h_x_embalse <- df_h_x_embalse[, -ncol(df_h_x_embalse)]
+
+
+df_precios <- read_excel(excel_file, sheet = 3)
+df_precios <- df_precios[, -ncol(df_precios)]
+
+
+# Primero unir df_hidrologia con df_h_x_embalse por "fecha"
+base_intermedia <- df_hidrologia %>%
+  inner_join(df_precios, by = "fecha")
+
+# Luego unir el resultado con df_precios por "fecha"
+base <- base_intermedia %>%
+  inner_join(df_h_x_embalse, by = "fecha")
+
+
+# --- 2. Análisis de Valores Faltantes (NAs) ---
+# Calcula la cantidad y el porcentaje de valores faltantes por columna.
+# Es crucial para decidir si necesitas imputar datos o eliminar filas/columnas.
+missing_values <- base %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Columna", values_to = "Valores_Faltantes") %>%
+  mutate(Porcentaje_Faltante = (Valores_Faltantes / nrow(base)) * 100) %>%
+  filter(Valores_Faltantes > 0) %>%
+  arrange(desc(Porcentaje_Faltante))
+
+cat("\n### 3. Análisis de Valores Faltantes ###\n")
+if (nrow(missing_values) > 0) {
+  print(missing_values)
+} else {
+  cat("¡Excelente! No se encontraron valores faltantes en el dataframe.\n")
+}
+
+```
+
+```{r ANÁLISIS DE CORRELACIÓN}
+
+
+# Crear un data frame vacío para guardar los crr
+crr <- data.frame(Variable = character(),
+                         Correlacion = numeric(),
+                         stringsAsFactors = FALSE)
+
+# Bucle por columnas
+for (col_name in names(base_intermedia)) {
+  # Evitar correlación de la variable consigo misma
+  if (col_name != "P" && is.numeric(base_intermedia[[col_name]])) {
+
+    # Calcular la correlación ignorando NAs
+    corr <- cor(base_intermedia$P, base_intermedia[[col_name]], use = "complete.obs")
+
+    # Agregar resultado a la tabla
+    crr <- rbind(crr, data.frame(Variable = col_name,
+                                               Correlacion = corr))
+  }
+}
+
+
+# 1. Eliminar la primera fila y las últimas 24 filas
+crr_ordenado <- crr[2:(nrow(crr) - 24), ]
+
+# 2. Crear una nueva columna con el valor absoluto de la correlación,
+#    y ordenar de mayor a menor esa nueva columna
+crr_ordenado <- crr_ordenado %>%
+  mutate(Correlacion_Abs = abs(Correlacion)) %>%
+  arrange(desc(Correlacion_Abs))
+
+# 3. Definir un umbral y filtrar las variables candidatas
+umbral_correlacion <- 0.4 # Puedes ajustar este valor
+variables_candidatas_paso1 <- crr_ordenado %>%
+  filter(Correlacion_Abs >= umbral_correlacion) %>%
+  pull(Variable) # Extrae los nombres de las variables en un vector
+
+print("Variables candidatas después del primer filtro (correlación > umbral):")
+print(variables_candidatas_paso1)
+
+
+# 4. Seleccionar solo las columnas numéricas relevantes de la base
+#    - Se incluye el precio 'P'.
+#    - Se excluyen los precios horarios (P0-P23) para no saturar el gráfico.
+columnas_numericas <- base_intermedia %>%
+  select(where(is.numeric)) %>%
+  select(-matches("^P([0-9]|1[0-9]|2[0-3])$")) # Ponemos 'P' al principio y quitamos P0-P23
+
+
+# 5. Calcular la matriz de correlación
+#    - 'use = "complete.obs"' maneja filas con datos faltantes.
+matriz_corr <- cor(columnas_numericas, use = "complete.obs")
+
+# 6. Visualizar la matriz con un heatmap
+#    - Los valores cercanos a 1 o -1 indican una fuerte correlación.
+#    - Fíjate en la fila/columna de 'P' para encontrar las variables más influyentes.
+ggcorrplot(matriz_corr,
+           hc.order = TRUE,      # Ordena las variables para agrupar las similares
+           type = "lower",       # Muestra solo la mitad inferior de la matriz
+           lab = TRUE,           # Muestra los coeficientes de correlación
+           lab_size = 2.5,       # Tamaño del texto de los coeficientes
+           colors = c("#6D9EC1", "white", "#E46726"), # Esquema de color
+           title = "Matriz de Correlación de Variables y Precio de Bolsa")
+
+# 7. Crear la matriz de correlación con valores absolutos
+matriz_corr_abs <- abs(matriz_corr)
+
+df_corr <- is.data.frame(matriz_corr_abs)
+
+
+# 8. Visualizar la matriz de correlación absoluta con un heatmap
+ggcorrplot(matriz_corr_abs,
+           hc.order = TRUE,
+           type = "lower",
+           lab = TRUE,
+           lab_size = 2.5,
+           colors = c("#6D9EC1", "white", "#E46726"),
+           title = "Matriz de Correlación Absoluta")
+
+
+
+# Convertir la matriz en data.frame
+df_corr <- as.data.frame(matriz_corr_abs)
+
+# Guardarla como archivo CSV
+write.csv(df_corr, "matriz_correlacion.csv", row.names = TRUE)
+
+
+
+
+```
+
+
+
+
+
+```{r MAPA DE UBICACIÓN DE EMBALSES}
+
+# 1. Descargar el mapa de Colombia con sus departamentos
+#    - Esto evita tener que buscar y cargar un shapefile manualmente.
+colombia_mapa <- ne_states(country = "colombia", returnclass = "sf")
+
+# 2. Crear una tabla con las coordenadas de los embalses
+#    - ¡IMPORTANTE! Debes completar esta lista con los nombres EXACTOS de tus embalses
+#      y sus coordenadas geográficas. He puesto algunos ejemplos comunes.
+coordenadas_embalses <- tribble(
+  ~embalse,               ~lat,     ~lon,
+  "El Peñol",             6.223,   -75.076,
+  "Guavio",               4.767,   -73.344,
+  "Betania",              2.723,   -75.438,
+  "Prado",                3.766,   -74.928,
+  "Chivor",               4.883,   -73.350,
+  "Esmeralda",            4.912,   -73.364, # Es el mismo embalse de Chivor
+  "Salvajina",            2.900,   -76.716,
+  "Playas",               6.345,   -74.952,
+  "Urrá I",               7.950,   -76.333,
+  "Tominé",               4.965,   -73.901
+  # <-- AÑADE MÁS EMBALSES AQUÍ
+)
+
+# 3. Preparar tus datos para el mapa
+#    - Tomamos la lista única de embalses de tu archivo.
+#    - Los unimos con nuestra tabla de coordenadas.
+embalses_a_mapear <- df_h_x_embalse %>%
+  distinct(embalse) %>%
+  left_join(coordenadas_embalses, by = "embalse") %>%
+  # Quitamos los embalses para los que no encontramos coordenadas
+  filter(!is.na(lat) & !is.na(lon))
+
+# Avisar si faltaron embalses por mapear
+embalses_no_encontrados <- df_h_x_embalse %>%
+  distinct(embalse) %>%
+  filter(!embalse %in% embalses_a_mapear$embalse)
+
+if(nrow(embalses_no_encontrados) > 0) {
+  cat("Aviso: No se encontraron coordenadas para los siguientes embalses y no se mostrarán en el mapa:\n")
+  print(embalses_no_encontrados$embalse)
+}
+
+# 4. Convertir el dataframe de embalses a un objeto espacial (sf)
+embalses_sf <- st_as_sf(embalses_a_mapear, coords = c("lon", "lat"), crs = 4326)
+
+# 5. Crear el mapa usando ggplot2
+ggplot() +
+  # Capa 1: El mapa de fondo de Colombia
+  geom_sf(data = colombia_mapa, fill = "gray90", color = "white") +
+  
+  # Capa 2: Los puntos que representan los embalses
+  geom_sf(data = embalses_sf, aes(color = embalse), size = 3, shape = 17) +
+  
+  # Capa 3 (Opcional): Las etiquetas con los nombres
+  # geom_sf_text(data = embalses_sf, aes(label = Embalse), nudge_y = 0.1, size = 3) +
+  
+  # Estilos y títulos
+  labs(
+    title = "Ubicación de Embalses en Colombia",
+    caption = "Fuente: Datos propios. Mapa base de rnaturalearth."
+  ) +
+  theme_void() + # Un tema limpio para mapas
+  theme(legend.position = "bottom") # Mover la leyenda abajo
+
+```
+
+
+
+```{r Modelo Lineal Clásico y Pruebas Diagnósticas, message=FALSE, warning=FALSE}
+# --- PASO 0: Limpiar datos ---
+
+# Limpiar los nombres de las columnas de tu dataframe para que sean fáciles de usar en la fórmula
+# Convierte "Volumen Máximo Técnico [GWh]" en "volumen_maximo_tecnico_gwh"
+base_limpia <- base_intermedia %>%
+  clean_names()
+
+# Verificar los nuevos nombres de las columnas
+cat("### Nombres de columnas limpiados ###\n")
+print(names(base_limpia))
+
+# Vamos a usar las variables que pediste. Asegúrate que los nombres coincidan con la salida anterior.
+# Asumiré que después de limpiar se llaman: "volumen_maximo_tecnico_gwh", "moi_gwh", "mos_gwh", "vertimientos_gwh"
+# ¡¡AJUSTA ESTOS NOMBRES SI ES NECESARIO!!
+variables_predictoras <- c("v_max_t", "moi", "mos", "vertimientos")
+variable_objetivo <- "p"
+
+# Crear un dataframe específico para el modelo, eliminando NAs
+df_modelo <- base_limpia %>%
+  select(fecha, all_of(variable_objetivo), all_of(variables_predictoras)) %>%
+  na.omit()
+
+
+# --- PASO 1: Construcción del Modelo Lineal ---
+
+cat("\n### Construcción del Modelo de Regresión Lineal (lm) ###\n")
+
+# Crear la fórmula del modelo dinámicamente
+formula_lm <- as.formula(paste(variable_objetivo, "~", paste(variables_predictoras, collapse = " + ")))
+cat("Fórmula del modelo:", deparse(formula_lm), "\n\n")
+
+# Ajustar el modelo lineal
+modelo_lm <- lm(formula_lm, data = df_modelo)
+
+
+# --- PASO 2: Interpretación del Resumen del Modelo ---
+
+cat("### Resumen del Modelo ###\n")
+print(summary(modelo_lm))
+
+cat("
+**Cómo interpretar el resumen:**
+1.  **Coefficients (Estimate):** Muestra el cambio en 'P' por cada unidad de cambio en la variable predictora, manteniendo las demás constantes. Un valor negativo (ej. para 'moi_gwh') indica que a medida que MOI sube, el precio 'P' tiende a bajar.
+2.  **Significancia (Pr(>|t|)):** Es el p-valor. Un valor pequeño (usualmente < 0.05) indica que la variable es **estadísticamente significativa** para el modelo. Los asteriscos ('***', '**', '*') son una guía visual para la significancia.
+3.  **Adjusted R-squared:** Indica el porcentaje de la variabilidad del precio 'P' que es explicado por tu modelo. Un valor de 0.6189 significa que el modelo explica aproximadamente el 61.9% de la varianza del precio.
+4.  **F-statistic y su p-value:** Evalúa la significancia global del modelo. Un p-valor muy pequeño (como en `p-value: < 2.2e-16`) significa que el modelo en su conjunto es significativo y mejor que un modelo nulo (sin predictores).
+")
+
+
+# --- PASO 3: Pruebas Diagnósticas (Validación de Supuestos del Modelo) ---
+
+cat("\n### Pruebas Diagnósticas de los Supuestos del Modelo ###\n")
+
+# Extraer los residuos del modelo para las pruebas
+residuos_modelo <- residuals(modelo_lm)
+
+# 1. SUPUESTO: Normalidad de los Residuos
+#    Los errores del modelo deben seguir una distribución normal.
+#    Prueba Gráfica (Q-Q Plot): Los puntos deben seguir la línea diagonal.
+plot(modelo_lm, which = 2, main = "Diagnóstico: Gráfico Q-Q de Normalidad")
+
+#    Prueba Estadística (Shapiro-Wilk):
+shapiro_test <- shapiro.test(residuos_modelo)
+cat("\n**1. Prueba de Normalidad de Residuos (Shapiro-Wilk):**\n")
+print(shapiro_test)
+cat(ifelse(shapiro_test$p.value < 0.05,
+           "Resultado: El p-valor es < 0.05. Los residuos NO siguen una distribución normal. (Supuesto VIOLADO)\n",
+           "Resultado: El p-valor es > 0.05. No se puede rechazar la normalidad. (Supuesto CUMPLIDO)\n"))
+
+
+# 2. SUPUESTO: Homocedasticidad (Varianza Constante de los Residuos)
+#    La varianza de los errores debe ser constante a lo largo de los valores predichos.
+#    Prueba Gráfica (Scale-Location): No debe haber un patrón claro (ej. forma de cono).
+plot(modelo_lm, which = 3, main = "Diagnóstico: Homocedasticidad (Scale-Location)")
+
+#    Prueba Estadística (Breusch-Pagan):
+bptest_result <- bptest(modelo_lm)
+cat("\n**2. Prueba de Homocedasticidad (Breusch-Pagan):**\n")
+print(bptest_result)
+cat(ifelse(bptest_result$p.value < 0.05,
+           "Resultado: El p-valor es < 0.05. Hay evidencia de heterocedasticidad. (Supuesto VIOLADO)\n",
+           "Resultado: El p-valor es > 0.05. No hay evidencia de heterocedasticidad. (Supuesto CUMPLIDO)\n"))
+
+
+# 3. SUPUESTO: No Autocorrelación de los Residuos (Independencia)
+#    Los errores no deben estar correlacionados entre sí (muy importante para datos de series de tiempo).
+#    Prueba Gráfica (ACF Plot): Las barras no deben superar las líneas azules (excepto en el lag 0).
+acf(residuos_modelo, main = "Diagnóstico: Autocorrelación de Residuos (ACF)")
+
+#    Prueba Estadística (Durbin-Watson):
+dwtest_result <- dwtest(modelo_lm)
+cat("\n**3. Prueba de Autocorrelación (Durbin-Watson):**\n")
+print(dwtest_result)
+cat(paste0("Resultado: El estadístico DW es ", round(dwtest_result$statistic, 2), ". Un valor cercano a 2 sugiere no autocorrelación. Valores < 1.5 o > 2.5 son problemáticos.\n",
+           ifelse(dwtest_result$p.value < 0.05,
+                  "El p-valor es < 0.05, lo que sugiere que SÍ hay autocorrelación. (Supuesto VIOLADO)\n",
+                  "El p-valor es > 0.05, no hay evidencia de autocorrelación. (Supuesto CUMPLIDO)\n")))
+
+
+# 4. SUPUESTO: No Multicolinealidad Perfecta
+#    Las variables predictoras no deben estar altamente correlacionadas entre sí.
+#    Prueba Estadística (Factor de Inflación de la Varianza - VIF):
+vif_values <- vif(modelo_lm)
+cat("\n**4. Prueba de Multicolinealidad (VIF):**\n")
+print(vif_values)
+cat("Resultado: Generalmente, un VIF > 5 o 10 indica un problema de multicolinealidad. Si todos los valores son bajos (ej. < 4), el supuesto se cumple.\n")
+
+```
+
+```{r Modelo V2.0 - ARIMAX, message=FALSE, warning=FALSE}
+# --- PASO 1: Preparación de Datos para un Modelo de Series de Tiempo ---
+
+# Usaremos el mismo dataframe 'df_modelo' que ya no tiene NAs.
+# La librería 'forecast' funciona mejor con objetos de tipo 'ts' (time series).
+
+# Convertir la variable objetivo 'p' a un objeto de serie de tiempo.
+# Asumimos una frecuencia semanal (frequency=7) para capturar posibles ciclos semanales.
+# Esto se puede ajustar si se detecta otra estacionalidad (ej. 365.25 para anual).
+y_ts <- ts(df_modelo$p, frequency = 7)
+
+# Crear la matriz de regresores exógenos (tus variables predictoras)
+# auto.arima necesita que sea una matriz numérica.
+xreg_matrix <- as.matrix(df_modelo[, variables_predictoras])
+
+
+# --- PASO 2: Construcción del Modelo ARIMAX ---
+
+cat("### Construcción del Modelo ARIMAX (Regresión con Errores ARIMA) ###\n")
+
+# Uso: auto.arima(). Esta función es muy potente:
+# 1. Encuentra automáticamente los mejores órdenes (p,d,q) para el componente ARIMA.
+# 2. Incluye tus variables predictoras a través del argumento 'xreg'.
+modelo_arimax <- auto.arima(
+  y_ts,
+  xreg = xreg_matrix,
+  stepwise = TRUE,   # Usar un método de búsqueda rápido
+  trace = TRUE,      # Muestra los modelos que va probando
+  seasonal = TRUE    # Permite la búsqueda de componentes estacionales
+)
+
+
+# --- PASO 3: Interpretación del Resumen del Modelo ARIMAX ---
+
+cat("\n### Resumen del Modelo ARIMAX ###\n")
+print(summary(modelo_arimax))
+
+cat("
+**Cómo interpretar este nuevo resumen:**
+1.  **ARIMA(p,d,q)(P,D,Q)[m]:** Esta es la estructura de serie de tiempo que el modelo encontró. Por ejemplo, ARIMA(2,1,2) significa que usó 2 términos autorregresivos (AR), 1 diferenciación (I) para manejar tendencias, y 2 términos de media móvil (MA).
+2.  **Coefficients:** Ahora tienes dos tipos de coeficientes:
+    - **Términos ARIMA (ar1, ma1, etc.):** Capturan la 'memoria' o dinámica interna de la serie.
+    - **Regresores (v_max_t, moi, etc.):** ¡Estos son los tuyos! Se interpretan de forma similar a 'lm', pero su efecto se mide DESPUÉS de haber tenido en cuenta la estructura temporal del precio. Sus p-valores ahora son más confiables.
+3.  **AICc, BIC:** Son criterios de información. Sirven para comparar modelos (un valor más bajo es mejor). `auto.arima` los usa para decidir cuál es el mejor modelo.
+")
+
+
+# --- PASO 4: ¡LA RE-EVALUACIÓN! Diagnósticos del Nuevo Modelo ---
+
+cat("\n### Diagnósticos del Modelo ARIMAX: ¿Resolvimos los problemas? ###\n")
+
+# La función checkresiduals() es una herramienta fantástica que hace varias pruebas a la vez.
+# Nuestro objetivo principal es que en el gráfico ACF, ninguna barra (salvo la primera)
+# supere las líneas azules. Eso indicaría que no hay más autocorrelación.
+checkresiduals(modelo_arimax)
+
+# La prueba Ljung-Box que se muestra arriba es el test estadístico clave.
+# Hipótesis Nula: Los residuos son independientes (no hay autocorrelación).
+# QUEREMOS un p-valor ALTO (> 0.05) para no rechazar la hipótesis nula.
+
+cat("\n**Conclusión del Diagnóstico de Autocorrelación:**\n")
+cat("El modelo ARIMAX debería haber eliminado la autocorrelación de los residuos. Si el p-valor del test de Ljung-Box es > 0.05, ¡hemos resuelto el problema más grave del modelo anterior!\n")
+
+# Adicionalmente, podemos revisar la normalidad de los nuevos residuos.
+shapiro_test_v2 <- shapiro.test(residuals(modelo_arimax))
+cat("\n**Prueba de Normalidad de Residuos (Shapiro-Wilk) para el Modelo V2:**\n")
+print(shapiro_test_v2)
+cat(ifelse(shapiro_test_v2$p.value < 0.05,
+           "Resultado: El supuesto de normalidad todavía podría estar violado, pero esto es menos crítico que la autocorrelación.\n",
+           "Resultado: ¡Excelente! Los residuos del nuevo modelo parecen ser normales.\n"))
+
+```
+
+```{r Modelo V2.1 - ARIMAX con Logaritmo, message=FALSE, warning=FALSE}
+# --- PASO 1 (V2.1): Aplicar la transformación logarítmica ---
+y_ts_log <- log(y_ts)
+
+# Graficar para ver la diferencia
+# autoplot(y_ts_log, main="Serie de Precio Transformada (Log)")
+
+
+# --- PASO 2 (V2.1): Construir el nuevo modelo ARIMAX sobre los datos logarítmicos ---
+cat("### Construyendo Modelo V2.1: ARIMAX sobre log(P) ###\n")
+
+modelo_arimax_log <- auto.arima(
+  y_ts_log,
+  xreg = xreg_matrix,
+  stepwise = TRUE,
+  trace = TRUE,
+  seasonal = TRUE
+)
+
+
+# --- PASO 3 (V2.1): Diagnósticos del nuevo modelo ---
+cat("\n### Diagnósticos del Modelo V2.1 (Logarítmico) ###\n")
+# El objetivo es que el p-valor de Ljung-Box sea ahora > 0.05
+checkresiduals(modelo_arimax_log)
+
+
+```
+
+```{r Prueba de Significancia de Regresores}
+# Vamos a construir un modelo ARIMA puro, SIN las variables exógenas
+cat("### Comparando modelos para evaluar la significancia de los regresores ###\n")
+
+modelo_sin_xreg <- auto.arima(
+  y_ts,
+  stepwise = TRUE,
+  trace = FALSE, # Lo ponemos en FALSE para una salida más limpia
+  seasonal = TRUE
+)
+
+# Comparar los criterios de información (AICc) de ambos modelos
+aicc_con_xreg <- modelo_arimax$aicc
+aicc_sin_xreg <- modelo_sin_xreg$aicc
+
+cat("\nCriterio de Información de Akaike Corregido (AICc):\n")
+cat(paste("  - Modelo CON regresores (ARIMAX):", round(aicc_con_xreg, 2), "\n"))
+cat(paste("  - Modelo SIN regresores (ARIMA puro):", round(aicc_sin_xreg, 2), "\n\n"))
+
+# Criterio: Un AICc más bajo es significativamente mejor.
+if (aicc_con_xreg < aicc_sin_xreg - 4) { # Una diferencia de > 4 se considera significativa
+  cat("Conclusión: El modelo CON regresores es significativamente mejor. ¡Tus variables SÍ aportan valor!\n")
+} else {
+  cat("Conclusión: El modelo CON regresores NO es significativamente mejor. Las variables no parecen aportar suficiente información.\n")
+}
+```
+
+```{r Visualización de Ajuste del Modelo}
+# Graficar los valores reales vs. los valores ajustados por el modelo ARIMAX
+autoplot(y_ts, series = "Real") +
+  autolayer(fitted(modelo_arimax), series = "Ajustado (ARIMAX)") +
+  autolayer(exp(fitted(modelo_arimax_log)), series = "Ajustado (Modelo 2)") +
+  labs(
+    title = "Comparación del Precio Real vs. Valores Ajustados por dos Modelos",
+    subtitle = "Evaluación del ajuste 'in-sample'",
+    x = "Tiempo",
+    y = "Precio (P)"
+  ) +
+  scale_color_manual(values = c(
+    "Real" = "black",
+    "Ajustado (ARIMAX)" = "red",
+    "Ajustado (Modelo 2)" = "blue"
+  )) +
+  theme_minimal()
+
+
+```
+
+
+```{r CHUNK 1: Pronóstico por Escenarios Múltiples}
+
+# --- PASO 1: Definir los valores para cada escenario ---
+# Usaremos los datos del último año para crear escenarios más estables.
+datos_ultimo_año <- df_modelo %>%
+  filter(fecha >= max(fecha) - years(1))
+
+# Calcular valores para cada escenario usando cuantiles y medias
+escenario_promedio <- datos_ultimo_año %>%
+  summarise(across(all_of(variables_predictoras), mean, na.rm = TRUE))
+
+escenario_humedo <- datos_ultimo_año %>%
+  summarise(
+    v_max_t = quantile(v_max_t, 0.75, na.rm = TRUE),
+    moi = quantile(moi, 0.75, na.rm = TRUE),
+    mos = quantile(mos, 0.25, na.rm = TRUE),
+    vertimientos = quantile(vertimientos, 0.25, na.rm = TRUE)
+  )
+
+escenario_seco <- datos_ultimo_año %>%
+  summarise(
+    v_max_t = quantile(v_max_t, 0.25, na.rm = TRUE),
+    moi = quantile(moi, 0.25, na.rm = TRUE),
+    mos = quantile(mos, 0.75, na.rm = TRUE),
+    vertimientos = quantile(vertimientos, 0.75, na.rm = TRUE)
+  )
+
+# --- PASO 2: Crear matrices de regresores futuros para el horizonte de 90 días ---
+horizonte_dias <- 90
+xreg_futuro_promedio <- as.matrix(escenario_promedio[rep(1, horizonte_dias), ])
+xreg_futuro_humedo <- as.matrix(escenario_humedo[rep(1, horizonte_dias), ])
+xreg_futuro_seco <- as.matrix(escenario_seco[rep(1, horizonte_dias), ])
+
+# --- PASO 3: Generar pronósticos para cada escenario ---
+pronostico_log_promedio <- forecast(modelo_arimax_log, xreg = xreg_futuro_promedio, h = horizonte_dias)
+pronostico_log_humedo <- forecast(modelo_arimax_log, xreg = xreg_futuro_humedo, h = horizonte_dias)
+pronostico_log_seco <- forecast(modelo_arimax_log, xreg = xreg_futuro_seco, h = horizonte_dias)
+
+# --- PASO 4: Combinar y graficar los resultados ---
+df_pronosticos_escenarios <- tibble(
+  Fecha = seq(from = max(df_modelo$fecha) + 1, by = "day", length.out = horizonte_dias),
+  Promedio = as.numeric(exp(pronostico_log_promedio$mean)),
+  Húmedo = as.numeric(exp(pronostico_log_humedo$mean)),
+  Seco = as.numeric(exp(pronostico_log_seco$mean))
+) %>%
+  pivot_longer(cols = -Fecha, names_to = "Escenario", values_to = "Pronostico")
+
+historico_plot <- df_modelo %>% filter(fecha >= max(fecha) - days(180))
+
+ggplot(data = historico_plot, aes(x = fecha, y = p)) +
+  geom_line(aes(color = "Histórico"), size = 1) +
+  geom_line(data = df_pronosticos_escenarios, aes(x = Fecha, y = Pronostico, color = Escenario), size = 1, linetype = "dashed") +
+  labs(
+    title = "Pronóstico de Precio por Escenarios Hidrológicos",
+    subtitle = "Proyección a 90 días",
+    x = "Fecha", y = "Precio (P)", color = "Leyenda"
+  ) +
+  scale_color_manual(values = c("Histórico" = "black", "Promedio" = "blue", "Húmedo" = "darkgreen", "Seco" = "red")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+# ***
+# * **Análisis y Limitaciones:**
+#     * **Análisis:** Este es el enfoque más útil para la **planificación estratégica**. Te permite responder preguntas como: *"¿Cuál es nuestro riesgo de precios altos si entramos en condiciones de sequía?"*. El abanico de pronósticos te da un rango de resultados probables en lugar de una única y falible predicción.
+#     * **Limitaciones:** La calidad del pronóstico depende enteramente de la **validez de los supuestos** de cada escenario. No te dice cuál escenario es más probable que ocurra.
+
+
+```
+
+
+
+```{r CHUNK 2: Pronóstico de Predictores (2 Etapas)}
+
+### Opción 2: Pronóstico de Predictores (Enfoque Estadístico de 2 Etapas)
+
+# Esta estrategia busca generar una única proyección "más probable" al no asumir un futuro constante, sino al **pronosticar la trayectoria de cada variable hidrológica** basándose en su propia historia.
+
+
+
+
+
+
+# --- PASO 1: Crear modelos y pronósticos para CADA predictor ---
+# Usaremos ETS (Alisado Exponencial) por su robustez y simplicidad.
+horizonte_dias <- 90
+
+# Convertir cada predictor a objeto 'ts' y pronosticar
+pronostico_vmax <- forecast(ets(ts(df_modelo$v_max_t)), h = horizonte_dias)
+pronostico_moi <- forecast(ets(ts(df_modelo$moi)), h = horizonte_dias)
+pronostico_mos <- forecast(ets(ts(df_modelo$mos)), h = horizonte_dias)
+pronostico_vertimientos <- forecast(ets(ts(df_modelo$vertimientos)), h = horizonte_dias)
+
+# --- PASO 2: Unir los pronósticos de los predictores en la matriz xreg_futuro ---
+xreg_futuro_pronosticado <- cbind(
+  v_max_t = pronostico_vmax$mean,
+  moi = pronostico_moi$mean,
+  mos = pronostico_mos$mean,
+  vertimientos = pronostico_vertimientos$mean
+)
+
+# --- PASO 3: Generar el pronóstico final de Precio usando esta matriz ---
+pronostico_log_final <- forecast(modelo_arimax_log, xreg = xreg_futuro_pronosticado, h = horizonte_dias)
+pronostico_final <- exp(pronostico_log_final$mean)
+
+# --- PASO 4: Graficar el resultado ---
+autoplot(y_ts, series = "Histórico") +
+  autolayer(pronostico_final, series = "Pronóstico Estadístico") +
+  labs(
+    title = "Pronóstico Estadístico de Precio",
+    subtitle = "Basado en pronósticos univariados para cada predictor",
+    x = "Tiempo", y = "Precio (P)"
+  ) +
+  theme_minimal()
+
+# ***
+# * **Análisis y Limitaciones:**
+#     * **Análisis:** Este método produce una **trayectoria futura más dinámica y estadísticamente fundamentada**, ya que asume que las variables hidrológicas continuarán con sus propias tendencias y estacionalidades. Es ideal si necesitas una única línea base de proyección.
+#     * **Limitaciones:** La principal limitación es la **propagación del error**: los errores en los pronósticos de las variables hidrológicas se introducirán en tu pronóstico final de precios, aumentando su incertidumbre.
+
+
+
+```
+
+
+```{r CHUNK 3: Pronóstico Híbrido con Rezagos}
+# ### Opción 3: Pronóstico Híbrido con Rezagos (Nuevo Enfoque)
+# 
+# Este es un mecanismo diferente. En lugar de proyectar los predictores, **modificamos el modelo para que use únicamente información pasada** (rezagos o *lags*) de las variables hidrológicas. De esta forma, para predecir el precio de mañana, solo necesitas los datos hidrológicos de hoy (o de ayer), los cuales ya conoces.
+# 
+# **¿Por qué funcionaría?** Porque el impacto de la hidrología sobre el precio no es instantáneo. El nivel de los embalses de hoy es un excelente predictor del precio de mañana. Al usar rezagos, convertimos el problema de "necesitar el futuro" en "necesitar el presente y el pasado reciente".
+
+
+
+# --- PASO 1: Crear un nuevo dataframe con variables rezagadas ---
+df_modelo_rezagos <- base_limpia %>%
+  # Creamos lags de 1 y 7 días para cada predictor
+  mutate(across(all_of(variables_predictoras), .fns = list(lag1 = ~lag(., 1), lag7 = ~lag(., 7)), .names = "{.col}_{.fn}")) %>%
+  select(fecha, p, ends_with("_lag1"), ends_with("_lag7")) %>%
+  na.omit()
+
+# --- PASO 2: Re-entrenar un modelo ARIMAX usando estas nuevas variables ---
+y_ts_rezagos <- ts(log(df_modelo_rezagos$p), frequency = 7)
+xreg_rezagos <- as.matrix(df_modelo_rezagos %>% select(ends_with("_lag1"), ends_with("_lag7")))
+
+# Corremos auto.arima con los nuevos regresores
+modelo_arimax_rezagos <- auto.arima(y_ts_rezagos, xreg = xreg_rezagos, seasonal = TRUE)
+cat("### Diagnósticos del Modelo con Rezagos ###\n")
+checkresiduals(modelo_arimax_rezagos) # ¡Verificar que siga siendo válido!
+
+# --- PASO 3: Pronosticar es ahora más fácil ---
+# Para pronosticar, solo necesitamos los últimos valores conocidos de los predictores para construir el xreg futuro.
+horizonte_dias <- 90
+ultimos_rezagos <- df_modelo_rezagos %>% tail(horizonte_dias) # Tomamos un historial
+xreg_futuro_rezagos <- as.matrix(ultimos_rezagos %>% select(ends_with("_lag1"), ends_with("_lag7")))
+
+# Generar el pronóstico
+pronostico_log_rezagos <- forecast(modelo_arimax_rezagos, xreg = xreg_futuro_rezagos)
+pronostico_rezagos <- exp(pronostico_log_rezagos$mean)
+
+# --- PASO 4: Graficar el resultado ---
+autoplot(ts(df_modelo_rezagos$p), series="Histórico") +
+  autolayer(pronostico_rezagos, series="Pronóstico con Rezagos") +
+  labs(title="Pronóstico con Variables Rezagadas", subtitle="No requiere proyecciones de predictores", y="Precio (P)") +
+  theme_minimal()
+
+
+```
+<!-- *** -->
+<!-- * **Análisis y Limitaciones:** -->
+<!--     * **Análisis:** Este es el enfoque **más robusto para la operación diaria y automatizada**, ya que no depende de supuestos ni de modelos secundarios. Se basa únicamente en información ya disponible al momento de generar el pronóstico. -->
+<!--     * **Limitaciones:** Puede perder algo de precisión en horizontes muy largos si hay cambios estructurales que los rezagos no capturan. El modelo asume que la relación histórica entre los rezagos y el precio se mantendrá. -->
+
+<!-- ### **¿Cuál sería el caso ideal?** -->
+
+<!-- El enfoque ideal depende de tu objetivo: -->
+
+<!-- 1.  **Para Planificación Estratégica y Análisis de Riesgos:** La **Opción 1 (Escenarios Múltiples)** es insuperable. Te da una visión completa del panorama de riesgos. -->
+<!-- 2.  **Para una Proyección Base "Más Probable":** La **Opción 2 (Pronóstico de Predictores)** es la más rigurosa estadísticamente, siempre que confíes en los modelos univariados de tus predictores. -->
+<!-- 3.  **Para un Sistema de Pronóstico Automatizado y Operativo:** La **Opción 3 (Rezagos)** es la más práctica y robusta, ya que elimina la dependencia de proyecciones externas. -->
+
+<!-- **Recomendación profesional:** Utiliza la **Opción 3** para tu pronóstico diario principal y la **Opción 1** para generar informes estratégicos mensuales o trimestrales que muestren los riesgos al alza y a la baja. -->
+
+
+
+```{r CHUNK Comparativo de Pronósticos, message=FALSE, warning=FALSE}
+
+# Variables y modelos que usaremos (asumimos que ya existen en tu entorno):
+# - df_modelo: El dataframe limpio con la columna 'fecha' y los predictores.
+# - modelo_arimax_log: Tu modelo ARIMAX final con transformación logarítmica.
+# - variables_predictoras: El vector con los nombres de tus predictores.
+
+horizonte_dias <- 90 # 3 meses de pronóstico
+
+# --- PASO 1: Generar el Pronóstico para cada Estrategia ---
+
+# --- Estrategia 1: Escenario Promedio (Último Año) ---
+datos_ultimo_año <- df_modelo %>% filter(fecha >= max(fecha) - years(1))
+escenario_promedio <- datos_ultimo_año %>% summarise(across(all_of(variables_predictoras), mean, na.rm = TRUE))
+xreg_futuro_promedio <- as.matrix(escenario_promedio[rep(1, horizonte_dias), ])
+pronostico_escenario <- forecast(modelo_arimax_log, xreg = xreg_futuro_promedio, h = horizonte_dias)
+
+# --- Estrategia 2: Pronóstico Estadístico (2 Etapas) ---
+modelo_moi <- ets(ts(df_modelo$moi))
+pronostico_moi <- forecast(modelo_moi, h = horizonte_dias)
+modelo_vmax <- ets(ts(df_modelo$v_max_t))
+pronostico_vmax <- forecast(modelo_vmax, h = horizonte_dias)
+modelo_mos <- ets(ts(df_modelo$mos))
+pronostico_mos <- forecast(modelo_mos, h = horizonte_dias)
+modelo_vertimientos <- ets(ts(df_modelo$vertimientos))
+pronostico_vertimientos <- forecast(modelo_vertimientos, h = horizonte_dias)
+xreg_futuro_pronosticado <- cbind(
+  v_max_t = pronostico_vmax$mean,
+  moi = pronostico_moi$mean,
+  mos = pronostico_mos$mean,
+  vertimientos = pronostico_vertimientos$mean
+)
+pronostico_estadistico <- forecast(modelo_arimax_log, xreg = xreg_futuro_pronosticado, h = horizonte_dias)
+
+# --- Estrategia 3: Modelo Univariado (Solo Precio, como Plan de Respaldo) ---
+# Usaremos un modelo ARIMA puro sobre el logaritmo del precio
+modelo_univariado <- auto.arima(log(ts(df_modelo$p, frequency=7)), seasonal=TRUE)
+pronostico_univariado <- forecast(modelo_univariado, h = horizonte_dias)
+
+
+# --- PASO 2: Combinar todos los pronósticos en una sola tabla ---
+fechas_pronostico <- seq(from = max(df_modelo$fecha) + 1, by = "day", length.out = horizonte_dias)
+
+df_comparativo <- tibble(
+  Fecha = fechas_pronostico,
+  `Escenario Promedio` = as.numeric(exp(pronostico_escenario$mean)),
+  `Estadístico (2 Etapas)` = as.numeric(exp(pronostico_estadistico$mean)),
+  `Univariado (Solo Precio)` = as.numeric(exp(pronostico_univariado$mean))
+) %>%
+  pivot_longer(cols = -Fecha, names_to = "Metodologia", values_to = "Pronostico")
+
+# --- PASO 3: Graficar la comparación ---
+historico_plot <- df_modelo %>% filter(fecha >= max(fecha) - days(180))
+
+ggplot(data = historico_plot, aes(x = fecha, y = p)) +
+  geom_line(aes(color = "Histórico"), size = 1.2) +
+  geom_line(data = df_comparativo, aes(x = Fecha, y = Pronostico, color = Metodologia), size = 1, linetype = "twodash") +
+  labs(
+    title = "Comparación de Estrategias de Pronóstico de Precio",
+    subtitle = "Proyección a 90 días usando diferentes supuestos para las variables hidrológicas",
+    x = "Fecha",
+    y = "Precio (P)",
+    color = "Estrategia"
+  ) +
+  scale_color_manual(values = c(
+    "Histórico" = "black",
+    "Escenario Promedio" = "#1f77b4", # Azul
+    "Estadístico (2 Etapas)" = "#ff7f0e", # Naranja
+    "Univariado (Solo Precio)" = "#2ca02c"  # Verde
+  )) +
+  theme_bw() +
+  theme(legend.position = "bottom", legend.title = element_text(face = "bold"))
+
+```
+
+<!-- *** -->
+
+<!-- ### ## Análisis y Elección del Mejor Pronóstico -->
+
+<!-- Ahora que vemos las tres curvas, podemos analizarlas para entender qué nos dice cada una y cuál podría ser más confiable. -->
+
+<!-- #### 🎯 **1. Pronóstico Univariado (Solo Precio)** -->
+<!-- * **¿Qué representa?** Este es el pronóstico **inercial**. Asume que el futuro del precio se parecerá a su pasado (tendencias, ciclos semanales, etc.), ignorando completamente cualquier información hidrológica. -->
+<!-- * **¿Cuándo confiar en él?** Es un excelente **punto de referencia (benchmark)**. Si los otros modelos, mucho más complejos, no ofrecen un pronóstico muy diferente a este, podría significar que, para el horizonte de 90 días, la información hidrológica no añade mucho valor predictivo sobre la propia inercia del precio. -->
+
+<!-- #### 🎯 **2. Pronóstico por Escenario Promedio** -->
+<!-- * **¿Qué representa?** Este es el pronóstico de **"reversión a la media"**. Muestra qué pasaría con el precio si las condiciones hidrológicas (que pueden haber sido extremas recientemente) vuelven a su promedio del último año y se mantienen ahí. -->
+<!-- * **¿Cuándo confiar en él?** Es una visión muy estable y conservadora. Es especialmente útil si crees que las condiciones climáticas anómalas (mucha lluvia o mucha sequía) no persistirán y tenderán a normalizarse. Es un ancla de estabilidad en tu análisis. -->
+
+<!-- #### 🎯 **3. Pronóstico Estadístico (2 Etapas)** -->
+<!-- * **¿Qué representa?** Este es, en teoría, el pronóstico **más probable y dinámico**. A diferencia del escenario promedio que es una línea plana de supuestos, este modelo incorpora las tendencias y estacionalidades proyectadas para *cada* variable hidrológica. Si el modelo de `moi` predice que los aportes seguirán bajando durante 30 días antes de recuperarse, esa dinámica se reflejará en el precio. -->
+<!-- * **¿Cuándo confiar en él?** Deberías considerarlo tu **pronóstico base o central**, ya que está 100% basado en la evidencia estadística de todas las series de datos. -->
+
+<!-- --- -->
+
+<!-- ### **Conclusión: ¿Cuál está más cerca de la realidad?** -->
+
+<!-- No hay una única respuesta, pero sí una estrategia ideal: -->
+
+<!-- 1.  **El Pronóstico Estadístico (2 Etapas) debería ser tu línea base principal.** Es el que contiene la mayor cantidad de información y refleja las trayectorias más probables de todas las variables. -->
+<!-- 2.  **Usa el Pronóstico por Escenarios (Seco y Húmedo, del chunk anterior) para construir un "cono de incertidumbre"** alrededor de tu línea base. La realidad muy probablemente se moverá dentro de este rango. -->
+<!-- 3.  **Usa el Pronóstico Univariado como un "chequeo de sensatez"**. Si tu pronóstico estadístico se desvía masivamente del univariado, pregúntate por qué. La respuesta debería estar en las proyecciones de las variables hidrológicas (ej. "mi modelo es más pesimista porque los modelos de aportes predicen una fuerte caída que el modelo univariado no puede ver"). -->
+
+<!-- En resumen, el **enfoque más robusto** es usar el pronóstico estadístico como tu mejor estimación y los escenarios para comunicar los riesgos y las oportunidades asociadas a ese pronóstico. -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r CHUNK: PRONÓSTICO BASADO EN ESCENARIO BASE}
+
+# 1. Definir el horizonte de pronóstico (ej. 90 días para 3 meses)
+horizonte_dias <- 90
+
+# 2. Crear la matriz de regresores futuros (xreg_futuro) para el Escenario Base
+#    Tomamos el último valor conocido de cada predictor y lo repetimos 90 veces.
+ultimos_valores <- df_modelo %>% tail(1) %>% select(all_of(variables_predictoras))
+xreg_futuro_base <- as.matrix(ultimos_valores[rep(1, horizonte_dias), ])
+
+# 3. Generar el pronóstico con el modelo logarítmico y este xreg futuro
+pronostico_log_base <- forecast(modelo_arimax_log, xreg = xreg_futuro_base, h = horizonte_dias)
+
+# 4. Revertir la transformación logarítmica para obtener el precio en su escala original
+pronostico_base <- exp(pronostico_log_base$mean)
+
+# 5. Visualizar
+autoplot(pronostico_base) +
+  labs(title="Pronóstico de Precio - Escenario Base",
+       subtitle="Asumiendo que las condiciones hidrológicas se mantienen constantes",
+       y="Precio (P)") +
+  theme_minimal()
+
+```
+
+
+```{r PRONÓSTICO DE PREDICTORES}
+
+horizonte_dias <- 90
+
+# 1. Crear modelos y pronósticos para CADA predictor
+#    Usaremos ETS (Exponential Smoothing) por su simplicidad y robustez.
+modelo_moi <- ets(ts(df_modelo$moi, frequency=7))
+pronostico_moi <- forecast(modelo_moi, h = horizonte_dias)
+
+modelo_vmax <- ets(ts(df_modelo$v_max_t, frequency=7))
+pronostico_vmax <- forecast(modelo_vmax, h = horizonte_dias)
+
+modelo_mos <- ets(ts(df_modelo$mos, frequency=7))
+pronostico_mos <- forecast(modelo_mos, h = horizonte_dias)
+
+modelo_vertimientos <- ets(ts(df_modelo$vertimientos, frequency=7))
+pronostico_vertimientos <- forecast(modelo_vertimientos, h = horizonte_dias)
+
+# 2. Unir los pronósticos de los predictores en una única matriz xreg_futuro
+xreg_futuro_pronosticado <- cbind(
+  v_max_t = pronostico_vmax$mean,
+  moi = pronostico_moi$mean,
+  mos = pronostico_mos$mean,
+  vertimientos = pronostico_vertimientos$mean
+)
+
+# 3. Generar el pronóstico final de Precio usando esta matriz
+pronostico_log_final <- forecast(modelo_arimax_log, xreg = xreg_futuro_pronosticado, h = horizonte_dias)
+
+# 4. Revertir la transformación logarítmica
+pronostico_final <- exp(pronostico_log_final$mean)
+
+# 5. Visualizar
+autoplot(pronostico_final) +
+  labs(title="Pronóstico de Precio - Enfoque Estadístico",
+       subtitle="Basado en pronósticos individuales para cada variable hidrológica",
+       y="Precio (P)") +
+  theme_minimal()
+
+
+```
+
+
+```{r PRONÓSTICO UNIVARIADO}
+
+# Asumiendo que guardaste el modelo sin regresores de la prueba anterior
+# Si no, lo volvemos a correr:
+modelo_sin_xreg <- auto.arima(log(y_ts), seasonal=TRUE)
+
+# Generar el pronóstico es directo, no necesita xreg
+pronostico_log_univariado <- forecast(modelo_sin_xreg, h = 90)
+
+# Revertir la transformación
+pronostico_univariado <- exp(pronostico_log_univariado$mean)
+
+# Visualizar
+autoplot(pronostico_univariado) +
+  labs(title="Pronóstico de Precio - Modelo Univariado",
+       subtitle="Ignorando las variables hidrológicas",
+       y="Precio (P)") +
+  theme_minimal()
+
+
+```
+
+
+```{r Múltiples Escenarios de Pronóstico}
+
+# --- PASO 1: Definir los valores para cada escenario ---
+
+
+
+# Calcular los valores para cada escenario
+escenario_promedio <- df_modelo %>%
+  summarise(across(all_of(variables_predictoras), mean, na.rm = TRUE))
+
+escenario_humedo <- df_modelo %>%
+  summarise(
+    v_max_t = quantile(v_max_t, 0.75, na.rm = TRUE),
+    moi = quantile(moi, 0.75, na.rm = TRUE),
+    mos = quantile(mos, 0.25, na.rm = TRUE), # MOS bajo en escenario húmedo
+    vertimientos = quantile(vertimientos, 0.25, na.rm = TRUE)
+  )
+
+escenario_seco <- df_modelo %>%
+  summarise(
+    v_max_t = quantile(v_max_t, 0.25, na.rm = TRUE),
+    moi = quantile(moi, 0.25, na.rm = TRUE),
+    mos = quantile(mos, 0.75, na.rm = TRUE), # MOS alto en escenario seco
+    vertimientos = quantile(vertimientos, 0.75, na.rm = TRUE)
+  )
+
+# --- PASO 2: Crear las matrices de regresores futuros para cada escenario ---
+horizonte_dias <- 90 # Pronóstico a 3 meses
+
+# Repetir los valores del escenario para los 90 días del horizonte
+xreg_futuro_promedio <- as.matrix(escenario_promedio[rep(1, horizonte_dias), ])
+xreg_futuro_humedo <- as.matrix(escenario_humedo[rep(1, horizonte_dias), ])
+xreg_futuro_seco <- as.matrix(escenario_seco[rep(1, horizonte_dias), ])
+
+# --- PASO 3: Generar los pronósticos para cada escenario ---
+pronostico_log_promedio <- forecast(modelo_arimax_log, xreg = xreg_futuro_promedio, h = horizonte_dias)
+pronostico_log_humedo <- forecast(modelo_arimax_log, xreg = xreg_futuro_humedo, h = horizonte_dias)
+pronostico_log_seco <- forecast(modelo_arimax_log, xreg = xreg_futuro_seco, h = horizonte_dias)
+
+# --- PASO 4: Combinar los resultados en una sola tabla para graficar ---
+# Convertimos los pronósticos a un formato "tidy" que ggplot2 adora
+
+df_pronosticos <- tibble(
+  Fecha = seq(from = as.Date("2025-08-23", format = "%Y-%m-%d"), by = "day", length.out = horizonte_dias),
+  Promedio = as.numeric(exp(pronostico_log_promedio$mean)),
+  Húmedo = as.numeric(exp(pronostico_log_humedo$mean)),
+  Seco = as.numeric(exp(pronostico_log_seco$mean))
+) %>%
+  # Pivotar la tabla para tener una columna "Escenario"
+  pivot_longer(cols = c(Promedio, Húmedo, Seco), names_to = "Escenario", values_to = "Pronostico")
+
+# --- PASO 5: Graficar todos los escenarios juntos ---
+# Seleccionar los datos históricos para dar contexto al gráfico
+
+df_modelo$fecha <- seq.Date(
+  from = as.Date("2025-07-23", format = "%Y-%m-%d"),
+  by = "day",
+  length.out = nrow(df_modelo)
+)
+
+
+
+historico_plot <- df_modelo %>%
+  filter(fecha >= as.Date("2025-08-23", format = "%Y-%m-%d") - days(90))
+
+ggplot(data = historico_plot, aes(x = fecha, y = p)) +
+  geom_line(aes(color = "Histórico"), size = 1) +
+  geom_line(data = df_pronosticos, aes(x = Fecha, y = Pronostico, color = Escenario), size = 1, linetype = "dashed") +
+  labs(
+    title = "Pronóstico de Precio de Bolsa bajo Múltiples Escenarios",
+    subtitle = "Proyección a 90 días basada en condiciones hidrológicas secas, promedio y húmedas",
+    x = "Fecha",
+    y = "Precio (P)",
+    color = "Leyenda"
+  ) +
+  scale_color_manual(values = c("Histórico" = "black", "Promedio" = "blue", "Húmedo" = "darkgreen", "Seco" = "red")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+
+```{r 2. Tabla Comparativa: Proyectado vs. Real (Backtesting)}
+
+# Para evaluar la verdadera capacidad predictiva de tu modelo, realizaremos un ejercicio de **backtesting**. Entrenaremos el modelo con datos hasta una fecha pasada (ej. hace 30 días) y lo usaremos para "pronosticar" los últimos 30 días, para los cuales ya conocemos el valor real. Esto nos da una medida honesta de su error fuera de muestra.
+
+
+# --- PASO 1: Dividir los datos en entrenamiento y prueba (hold-out) ---
+
+# Vamos a usar los últimos 30 días como nuestro conjunto de "prueba"
+dias_prueba <- 30
+fecha_corte <- max(df_modelo$fecha) - days(dias_prueba)
+
+df_entrenamiento <- df_modelo %>% filter(fecha <= fecha_corte)
+df_prueba <- df_modelo %>% filter(fecha > fecha_corte)
+
+# --- PASO 2: Re-entrenar el modelo SOLO con el conjunto de entrenamiento ---
+y_ts_entrenamiento <- ts(log(df_entrenamiento$p), frequency = 7)
+xreg_entrenamiento <- as.matrix(df_entrenamiento[, variables_predictoras])
+
+# Re-entrenamos el modelo. Usamos los mismos parámetros encontrados por auto.arima antes
+# para asegurar consistencia y velocidad. Si no, puedes correr auto.arima() de nuevo.
+modelo_backtesting <- Arima(
+  y_ts_entrenamiento,
+  order = arimaorder(modelo_arimax_log)[1:3],
+  seasonal = arimaorder(modelo_arimax_log)[4:6],
+  xreg = xreg_entrenamiento
+)
+
+# --- PASO 3: "Pronosticar" sobre el período de prueba ---
+# Usamos los valores REALES de los regresores del conjunto de prueba.
+# Esto simula un pronóstico donde tendríamos perfecta información de los predictores.
+xreg_prueba <- as.matrix(df_prueba[, variables_predictoras])
+pronostico_prueba_log <- forecast(modelo_backtesting, xreg = xreg_prueba, h = dias_prueba)
+
+# --- PASO 4: Crear la tabla comparativa ---
+tabla_comparativa <- tibble(
+  Fecha = df_prueba$fecha,
+  Valor_Real = df_prueba$p,
+  Pronostico = as.numeric(exp(pronostico_prueba_log$mean)),
+  Diferencia_Absoluta = abs(Valor_Real - Pronostico),
+  Diferencia_Porcentual = (Diferencia_Absoluta / Valor_Real) * 100
+)
+
+cat("### Tabla Comparativa: Proyectado vs. Real (Últimos 30 días) ###\n")
+print(tabla_comparativa)
+
+# --- PASO 5: Calcular métricas de error globales para el período de prueba ---
+rmse_prueba <- sqrt(mean(tabla_comparativa$Diferencia_Absoluta^2))
+mape_prueba <- mean(tabla_comparativa$Diferencia_Porcentual)
+
+cat("\n### Métricas de Error Fuera de Muestra (Backtesting) ###\n")
+cat(paste("RMSE en el período de prueba:", round(rmse_prueba, 2), "\n"))
+cat(paste("MAPE en el período de prueba:", round(mape_prueba, 2), "%\n"))
+
+```
+
+

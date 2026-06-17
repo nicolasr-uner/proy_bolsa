@@ -1,0 +1,29 @@
+# Entornos
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+
+# Datos y salidas (se ignora el contenido, se conserva la carpeta via .gitkeep)
+data/raw/*
+data/interim/*
+data/processed/*
+outputs/forecasts/*
+outputs/reports/*
+!**/.gitkeep
+
+# Datos fuente pesados (se conservan en disco, fuera de git)
+*.xlsx
+*.xls
+*.rds
+*.RData
+*.parquet
+
+# Tracking / experimentos
+mlruns/
+
+# Entorno y secretos
+.env
+*.log

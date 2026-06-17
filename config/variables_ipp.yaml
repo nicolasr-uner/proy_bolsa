@@ -1,0 +1,42 @@
+# Diccionario de variables y supuestos: modelo de IPP.
+# Estado inicial (Fase 0). Las fuentes se validan en la Fase 2.
+
+objetivo:
+  ipp:
+    descripcion: Indice de Precios del Productor - Oferta Interna
+    fuente: DANE (oficial) / Banco de la Republica (SUAMECA, SDMX)
+    granularidad: mensual
+    base: dic-2014 = 100
+    transformacion: "variacion mensual (log-dif); modelar nivel o variacion"
+    confianza: alta
+    nota: "DANE publica un dato PROVISIONAL y lo revisa el mes siguiente -> el loop debe re-incorporar la version definitiva."
+
+drivers:
+  trm:
+    descripcion: Tasa de cambio representativa del mercado (USD/COP)
+    fuente: Banco de la Republica (SDMX) / SUAMECA
+    granularidad: diaria -> promedio mensual
+    unidad: COP/USD
+    transformacion: "variacion mensual; rezagos 0-2 meses"
+    confianza: alta
+  brent:
+    descripcion: Precio internacional del petroleo (Brent)
+    fuente: FRED / EIA
+    granularidad: diaria -> promedio mensual
+    unidad: USD/barril
+    transformacion: "variacion mensual; rezagos 0-2 meses"
+    confianza: alta
+  ppi_usa:
+    descripcion: Producer Price Index de EE.UU. (transmision internacional)
+    fuente: FRED (BLS)
+    granularidad: mensual
+    confianza: media
+
+cointegracion:
+  descripcion: "Relacion de largo plazo IPP ~ TRM + Brent (test de Johansen -> VECM)"
+  variables: [ipp, trm, brent]
+
+supuestos_generales:
+  - "El IPP de oferta interna es sensible a TRM y commodities (economia abierta)."
+  - "El IPP suele anticipar al IPC (util para nowcasting futuro)."
+  - "Las revisiones mensuales de DANE se tratan como nueva informacion, no como error del modelo."
