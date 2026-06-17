@@ -12,7 +12,12 @@ data/interim/*
 data/processed/*
 outputs/forecasts/*
 outputs/reports/*
+outputs/runs/*
 !**/.gitkeep
+
+# Carpetas de datos fuente OneDrive / externas
+"Estimaci\303\263n precio de Bolsa*"
+Estimaci*
 
 # Datos fuente pesados (se conservan en disco, fuera de git)
 *.xlsx
