@@ -249,6 +249,11 @@ class EnsembleNivel:
     lgb: LGBNivel = field(default_factory=LGBNivel)
     w_sarimax: float = 0.5
     w_lgb: float = 0.5
+    # Correccion de sesgo por horizonte: clave=h, valor=COP/kWh a restar del pronostico.
+    # Se actualiza desde el loop mensual con la media de errores recientes.
+    # No se estima automaticamente en fit() porque el sesgo depende del regimen actual
+    # y puede cambiar entre entrenamiento y despliegue (El Nino vs post-El Nino).
+    sesgo_por_horizonte: dict = field(default_factory=dict)
 
     def fit(self, df_train: pd.DataFrame, df_val: pd.DataFrame | None = None) -> "EnsembleNivel":
         """Ajusta ambos modelos y calibra pesos si se pasa df_val."""
@@ -258,6 +263,18 @@ class EnsembleNivel:
         if df_val is not None and len(df_val) > 0:
             self._calibrar_pesos(df_val)
         return self
+
+    def actualizar_sesgo(self, sesgo: dict) -> None:
+        """Actualiza la correccion de sesgo desde el loop mensual.
+
+        Parametros
+        ----------
+        sesgo : dict {horizonte_dias: sesgo_medio_COP}
+            Sesgo medio (pred - real) de las ultimas N semanas de rolling-origin.
+            Ejemplo: {1: 50.2, 7: 80.5, 14: 90.0, 30: 110.0}
+        """
+        self.sesgo_por_horizonte.update(sesgo)
+        logger.info("Sesgos actualizados: %s", {k: f"{v:+.1f}" for k, v in self.sesgo_por_horizonte.items()})
 
     def _calibrar_pesos(self, df_val: pd.DataFrame) -> None:
         """Pesos inverse-MSE sobre el conjunto de validacion."""
@@ -319,6 +336,10 @@ class EnsembleNivel:
 
         # Ensemble
         pred = self.w_sarimax * pred_sar + self.w_lgb * pred_lgb
+
+        # Correccion de sesgo por horizonte (si fue actualizada desde el loop mensual)
+        if self.sesgo_por_horizonte and n in self.sesgo_por_horizonte:
+            pred = pred - self.sesgo_por_horizonte[n]
 
         # Ancho del CI en log-espacio desde SARIMAX, centrado en el ensemble
         log_pred_sar = sar_df["pred_log"].values
