@@ -27,7 +27,7 @@ COPY .streamlit/ .streamlit/
 
 EXPOSE 8501
 
-HEALTHCHECK CMD curl -f http://localhost:8501/_stcore/health || exit 1
+HEALTHCHECK CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
 
 CMD ["python", "-m", "streamlit", "run", "dashboard/app.py", \
      "--server.port=8501", "--server.address=0.0.0.0"]

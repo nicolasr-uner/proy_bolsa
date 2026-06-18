@@ -20,12 +20,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="statsmodels")
+warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
 
 ROOT = Path(__file__).parent.parent
 RUNS = ROOT / "outputs" / "runs"
 PROCESSED = ROOT / "data" / "processed"
-ESCENARIOS_DIR = ROOT / "outputs" / "escenarios"
 
 st.set_page_config(
     page_title="Proyecciones Energía Colombia",
@@ -361,7 +362,7 @@ with tab_esc_bolsa:
 
             submitted_b = st.form_submit_button("Calcular escenario", type="primary")
 
-        if submitted_b or st.session_state.get("_bolsa_recalc"):
+        if submitted_b:
             with st.spinner("Calculando..."):
                 fc_b = modelo_b.pronosticar(
                     horizonte_b,

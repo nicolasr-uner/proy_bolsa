@@ -187,6 +187,12 @@ class PronosticadorBolsa:
         Si escenarios_multiples=True: devuelve dict{'seco':..., 'promedio':..., 'humedo':...}
         """
         if escenarios_multiples:
+            if aportes_pct is not None or volumen_util_pct is not None:
+                raise ValueError(
+                    "escenarios_multiples=True usa los presets de hidrología de cada escenario; "
+                    "no puede combinarse con aportes_pct/volumen_util_pct. "
+                    "Llame pronosticar() una vez por escenario con los valores deseados."
+                )
             return {
                 esc: self.pronosticar(
                     horizonte_dias, fecha_inicio, escenario=esc,

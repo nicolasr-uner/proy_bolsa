@@ -32,3 +32,4 @@ mlruns/
 # Entorno y secretos
 .env
 *.log
+dashboard/auth.yaml

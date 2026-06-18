@@ -266,7 +266,7 @@ class VECMDriversIPP:
             warnings.simplefilter("ignore")
             fc = self._model.predict(steps=horizon)
 
-        # fc es array (horizon, 3): columnas = ipp_log, trm_log, brent_log
+        # fc es array (horizon, 2): columnas = [ipp_log, brent_cop_log]
         ipp_log_pred = fc[:, 0]
         pred = np.exp(ipp_log_pred)
 
@@ -620,7 +620,11 @@ class PronosticadorIPP:
         futuro["trm_yoy_lag1m"]   = [trm_yoy_hist]   + [trm_var_anual   * 100] * (horizonte - 1)
         futuro["brent_yoy_lag1m"] = [brent_yoy_hist] + [brent_var_anual * 100] * (horizonte - 1)
 
-        # Lags de IPP del ultimo periodo observado (para LGB autoregresivo)
+        # Lags de IPP: congelados en el último valor observado para todos los meses del
+        # horizonte. En pronóstico multi-paso el valor real de ipp_lag1m en el mes 2
+        # depende de la predicción del mes 1, pero actualizar recursivamente amplificaría
+        # el error. SARIMAX y VECM manejan la dinámica de largo plazo; LGB usa estos lags
+        # principalmente para anclar el nivel inicial.
         for lag_col in ("ipp_lag1m", "ipp_lag2m", "ipp_lag3m", "ipp_lag12m"):
             if lag_col in hist.columns:
                 futuro[lag_col] = float(hist[lag_col].iloc[-1])
