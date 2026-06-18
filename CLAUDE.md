@@ -42,7 +42,7 @@ proy_bolsa/
 │   └── processed/               # Feature matrices listas para el modelo
 ├── outputs/
 │   └── runs/{YYYY-MM}/          # Resultado de cada ciclo mensual
-└── tests/                       # 101 tests (pytest)
+└── tests/                       # 108 tests (pytest)
 ```
 
 ## Checklist mensual (ejecutar el primer día hábil de cada mes)
@@ -97,10 +97,11 @@ $pyexe = "C:\Users\Lenovo\AppData\Local\Python\bin\python.exe"
 ```
 
 Abrir http://localhost:8501 y confirmar:
-- Tab "Precio Bolsa": pronóstico 7d con bandas de incertidumbre
+- Tab "Precio Bolsa (corto)": pronóstico 7d con bandas de incertidumbre
 - Tab "Perfil Horario": heatmap tipo_día × hora razonable
-- Tab "Escenarios": seco/promedio/húmedo coherentes (seco > promedio > húmedo)
-- Tab "Seguimiento": errores del ciclo anterior registrados
+- Tab "Escenarios Bolsa": sliders aportes/volumen/ONI → seco > promedio > húmedo
+- Tab "IPP y Escenarios": sliders TRM%/Brent% → alto > base > bajo
+- Tab "Seguimiento de Precisión": errores del ciclo anterior registrados
 
 ### 4. Alertas a considerar
 
@@ -117,7 +118,7 @@ El loop mensual NO emite alertas automáticas (se diseñó para ser explícito).
 | `data/processed/bolsa_features_diario.parquet` | 1,261 días × 32 cols | Automática (descarga) |
 | `data/processed/bolsa_features_horario.parquet` | 30,264 filas × 31 cols | Automática |
 | `data/processed/perfil_horario.parquet` | 864 celdas (3 tipo×12 mes×24h) | Automática |
-| `data/processed/ipp_features_mensual.parquet` | 42 meses × 20 cols | Manual (DANE) |
+| `data/processed/ipp_features_mensual.parquet` | 137 meses × 34 cols | Manual (DANE) |
 | `data/raw/macro/ipp_manual.csv` | Serie IPP cruda DANE | Manual mensual |
 
 ## Resultados del backtest (junio 2026)
@@ -142,7 +143,7 @@ El Niño 2023-2024 (precios ~800–2000 COP/kWh) y el período de test es post-N
 
 ```powershell
 .venv\Scripts\python -m pytest tests/ -v
-# 101 passed
+# 108 passed
 ```
 
 ## Notas de diseño importantes
@@ -157,9 +158,23 @@ El Niño 2023-2024 (precios ~800–2000 COP/kWh) y el período de test es post-N
 3. **Data leak en backtest**: para h > 1, `_fix_lags_precio()` fija los lags del
    precio en el último valor de entrenamiento (evita que LGB vea el futuro).
 
-4. **VECM en IPP**: activado solo si el test de Johansen detecta cointegración.
-   Con datos sintéticos o histórico corto puede no estar disponible → degradación
-   elegante (`_available=False`, peso=0 en ensemble).
+4. **VECM en IPP**: sistema de 2 variables `{ipp, brent_cop}`. Activado solo si
+   Johansen detecta cointegración. Con histórico corto puede no estar disponible →
+   degradación elegante (`_available=False`, peso=0 en ensemble).
 
 5. **BanRep SDMX bloqueado**: `load_ipp_local()` es el método requerido para IPP.
    La función `cargar_ipp_banrep_sdmx()` existe pero falla en el entorno actual.
+
+6. **Drivers IPP (ortogonales)**: el modelo usa `brent_cop = Brent×TRM` (VIF≈1.04),
+   `brent_yoy` y `trm_yoy` (variaciones YoY en %). `ppi_usa` fue eliminado del set de
+   features por alta multicolinealidad (VIF=7.65). La columna `ppi_usa_lag1m` puede
+   seguir apareciendo en el parquet (columna huérfana del pipeline de features) pero
+   ningún modelo la consume.
+
+7. **`construir_futuro_drivers` en IPP**: firma actual es `(horizonte, trm_var_anual,
+   brent_var_anual, oni)`. El parámetro `ppi_var_anual` fue eliminado. El dashboard
+   usa esta función para los sliders de escenarios.
+
+8. **Override de hidrología en Bolsa**: `pronosticar(aportes_pct=X, volumen_util_pct=Y)`
+   acepta valores arbitrarios del slider. Es incompatible con `escenarios_multiples=True`
+   (levanta `ValueError` si se usan juntos).
