@@ -37,16 +37,22 @@ logger = logging.getLogger(__name__)
 # Constantes
 # ---------------------------------------------------------------------------
 
-_EXOG_SARIMAX = ["trm_lag1m", "trm_lag2m", "brent_lag1m", "brent_lag2m",
-                 "ppi_usa_lag1m", "enso_el_nino", "cos_mes", "sin_mes"]
+# Drivers ortogonales post-estudio (ver docs/estudio_drivers_ipp.md)
+# brent_cop = Brent_USD × TRM elimina multicolinealidad (PPI_USA VIF=7.65 → descartado)
+# brent_yoy / trm_yoy en % anual escalan bien con dlog(IPP): coef interpretable como elasticidad parcial
+# (brent_cop en nivel escala mal con dlog IPP: coef→0, sin efecto en escenarios)
+_EXOG_SARIMAX = ["brent_yoy_lag1m", "trm_yoy_lag1m", "enso_el_nino", "cos_mes", "sin_mes"]
 
-_FEATS_LGB = ["trm", "trm_lag1m", "trm_lag2m", "trm_lag3m",
-              "brent", "brent_lag1m", "brent_lag2m", "brent_lag3m",
-              "ppi_usa_lag1m", "ppi_usa_lag2m",
-              "enso_el_nino", "enso_la_nina", "oni_lag",
-              "mes", "cos_mes", "sin_mes"]
+_FEATS_LGB = [
+    "brent_cop", "brent_cop_lag1m", "brent_cop_lag2m", "brent_cop_lag3m",
+    "trm_yoy", "trm_yoy_lag1m",
+    "brent_yoy", "brent_yoy_lag1m",
+    "ipp_lag1m", "ipp_lag2m", "ipp_lag3m", "ipp_lag12m",
+    "enso_el_nino", "enso_la_nina", "oni_lag",
+    "mes", "cos_mes", "sin_mes",
+]
 
-_VECM_VARS = ["ipp_log", "trm_log", "brent_log"]  # variables para el sistema VECM
+_VECM_VARS = ["ipp", "brent_cop"]  # sistema 2-variable: más estable con n≈137
 
 
 # ---------------------------------------------------------------------------
@@ -54,35 +60,39 @@ _VECM_VARS = ["ipp_log", "trm_log", "brent_log"]  # variables para el sistema VE
 # ---------------------------------------------------------------------------
 
 def johansen_cointegracion(df: pd.DataFrame, max_lags: int = 2) -> dict:
-    """Aplica el test de Johansen al sistema IPP, TRM, Brent.
+    """Aplica el test de Johansen al sistema {IPP, brent_cop}.
 
-    Requiere que df tenga columnas: ipp, trm, brent (valores originales, no logs).
+    Si brent_cop no está en df pero sí brent y trm, lo computa internamente.
 
     Returns
     -------
     dict con:
         n_cointegrating_vectors : número de vectores de cointegración detectados
-        eigen_stats             : estadísticos propios
         trace_stats             : estadísticos traza
         p_valor_aprox           : '< 0.05' o '>= 0.05' (Johansen no da p-valores exactos)
     """
-    required = ["ipp", "trm", "brent"]
+    df = df.copy()
+    if "brent_cop" not in df.columns:
+        if "brent" in df.columns and "trm" in df.columns:
+            df["brent_cop"] = df["brent"] * df["trm"]
+        else:
+            raise ValueError("Faltan columnas para Johansen: necesita brent_cop (o brent+trm) e ipp")
+
+    required = ["ipp", "brent_cop"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas para Johansen: {missing}")
 
     data = df[required].dropna()
     if len(data) < 20:
-        return {"n_cointegrating_vectors": 0, "nota": "datos insuficientes (<20 obs)"}
+        return {"n_cointegrating_vectors": 0, "cointegran": False, "nota": "datos insuficientes (<20 obs)"}
 
     data_log = np.log(data.astype(float))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         res = coint_johansen(data_log.values, det_order=0, k_ar_diff=max_lags)
 
-    # El test Johansen produce tablas de valores criticos al 90/95/99%
-    # Usamos el estadístico de traza al 95% (indice 1)
-    trace_stat = res.lr1     # estadístico traza para r=0, r<=1, r<=2
+    trace_stat = res.lr1     # estadístico traza
     crit_95 = res.cvt[:, 1]  # valores criticos al 95%
     n_coint = int(np.sum(trace_stat > crit_95))
 
@@ -212,21 +222,29 @@ class VECMDriversIPP:
     _available: bool = field(default=False, init=False, repr=False)
 
     def fit(self, df_train: pd.DataFrame) -> "VECMDriversIPP":
-        required = [c for c in ["ipp", "trm", "brent"] if c in df_train.columns]
-        if len(required) < 3 or len(df_train) < 20:
-            logger.warning("VECM no disponible: faltan columnas o datos insuficientes")
+        df = df_train.copy()
+        if "brent_cop" not in df.columns:
+            if "brent" in df.columns and "trm" in df.columns:
+                df["brent_cop"] = df["brent"] * df["trm"]
+            else:
+                logger.warning("VECM no disponible: falta brent_cop (o brent+trm)")
+                self._available = False
+                return self
+
+        if "ipp" not in df.columns or len(df) < 20:
+            logger.warning("VECM no disponible: falta ipp o datos insuficientes")
             self._available = False
             return self
 
-        data = df_train[["ipp", "trm", "brent"]].dropna()
+        data = df[["ipp", "brent_cop"]].dropna()
         if len(data) < 20:
             self._available = False
             return self
 
         data_log = np.log(data.astype(float))
 
-        # Test de cointegración
-        test = johansen_cointegracion(data)
+        # Test de cointegración {IPP, brent_cop}
+        test = johansen_cointegracion(df)
         n_coint = max(1, test["n_cointegrating_vectors"])
 
         with warnings.catch_warnings():
@@ -535,6 +553,88 @@ class PronosticadorIPP:
         df_futuro["cos_mes"] = np.cos(2 * np.pi * fechas.month / 12)
         df_futuro["sin_mes"] = np.sin(2 * np.pi * fechas.month / 12)
         return df_futuro
+
+    def construir_futuro_drivers(
+        self,
+        horizonte: int,
+        trm_var_anual: float = 0.0,
+        brent_var_anual: float = 0.0,
+        oni: float | None = None,
+    ) -> pd.DataFrame:
+        """Construye df_futuro con los drivers ortogonales del IPP.
+
+        Usado por el dashboard interactivo para escenarios "what-if" de IPP.
+        Ver docs/estudio_drivers_ipp.md para el fundamento económico.
+
+        Parametros
+        ----------
+        horizonte       : meses a proyectar
+        trm_var_anual   : variación % ANUAL de TRM (0.05 = depreciación 5%/año)
+        brent_var_anual : variación % ANUAL de Brent USD
+        oni             : valor ONI asumido (constante). Si None, propaga el ultimo.
+
+        Produce las columnas que consumen SARIMAX y LGB:
+          brent_cop, brent_cop_lag{1,2,3}m,
+          trm_yoy, trm_yoy_lag1m,
+          brent_yoy, brent_yoy_lag1m,
+          cos_mes, sin_mes, mes, oni_lag, enso_*
+        """
+        hist = self._df_train
+        ultima = hist.iloc[-1]
+        fechas = pd.date_range(self._fecha_ultimo + pd.DateOffset(months=1),
+                               periods=horizonte, freq="MS")
+
+        futuro = pd.DataFrame({"fecha": fechas})
+        futuro["mes"] = fechas.month
+        futuro["cos_mes"] = np.cos(2 * np.pi * fechas.month / 12)
+        futuro["sin_mes"] = np.sin(2 * np.pi * fechas.month / 12)
+
+        # Trayectorias de TRM y Brent (compuesta mensual)
+        trm_base  = float(hist["trm"].iloc[-1])  if "trm"   in hist.columns else 4000.0
+        brent_base = float(hist["brent"].iloc[-1]) if "brent" in hist.columns else 80.0
+        trm_factor   = (1.0 + trm_var_anual)   ** (1.0 / 12.0)
+        brent_factor = (1.0 + brent_var_anual) ** (1.0 / 12.0)
+        futuro["trm"]   = [trm_base   * trm_factor   ** (t + 1) for t in range(horizonte)]
+        futuro["brent"] = [brent_base * brent_factor ** (t + 1) for t in range(horizonte)]
+
+        # brent_cop = Brent_USD × TRM: variable ortogonal principal
+        futuro["brent_cop"] = futuro["brent"] * futuro["trm"]
+        brent_cop_hist = (
+            hist["brent_cop"] if "brent_cop" in hist.columns
+            else hist["brent"] * hist["trm"]
+        )
+        brent_cop_full = pd.concat(
+            [brent_cop_hist.reset_index(drop=True), futuro["brent_cop"].reset_index(drop=True)],
+            ignore_index=True,
+        )
+        for lag in (1, 2, 3):
+            futuro[f"brent_cop_lag{lag}m"] = brent_cop_full.shift(lag).iloc[-horizonte:].to_numpy()
+
+        # trm_yoy y brent_yoy: el escenario asumido ES la variación anual (en %)
+        # Lag1m: mes 1 usa el último valor histórico; meses 2+ usan el valor del escenario
+        # (esto replica el comportamiento real: en el primer mes el lag todavía refleja historia)
+        trm_yoy_hist   = float(hist["trm_yoy"].iloc[-1])   if "trm_yoy"   in hist.columns else trm_var_anual   * 100
+        brent_yoy_hist = float(hist["brent_yoy"].iloc[-1]) if "brent_yoy" in hist.columns else brent_var_anual * 100
+        futuro["trm_yoy"]         = trm_var_anual   * 100
+        futuro["brent_yoy"]       = brent_var_anual * 100
+        futuro["trm_yoy_lag1m"]   = [trm_yoy_hist]   + [trm_var_anual   * 100] * (horizonte - 1)
+        futuro["brent_yoy_lag1m"] = [brent_yoy_hist] + [brent_var_anual * 100] * (horizonte - 1)
+
+        # Lags de IPP del ultimo periodo observado (para LGB autoregresivo)
+        for lag_col in ("ipp_lag1m", "ipp_lag2m", "ipp_lag3m", "ipp_lag12m"):
+            if lag_col in hist.columns:
+                futuro[lag_col] = float(hist[lag_col].iloc[-1])
+
+        # ENSO / ONI
+        futuro["oni_lag"] = oni if oni is not None else float(ultima.get("oni_lag", 0.0))
+        if oni is not None:
+            futuro["enso_el_nino"] = int(oni >= 0.5)
+            futuro["enso_la_nina"] = int(oni <= -0.5)
+        else:
+            futuro["enso_el_nino"] = int(ultima.get("enso_el_nino", 0))
+            futuro["enso_la_nina"] = int(ultima.get("enso_la_nina", 0))
+
+        return futuro
 
     def resumen_modelo(self) -> dict:
         return {

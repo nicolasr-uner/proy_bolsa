@@ -228,10 +228,26 @@ def construir_features_ipp() -> None:
     macro["cos_mes"] = macro["mes"].apply(lambda m: __import__("math").cos(2 * 3.14159 * m / 12))
     macro["sin_mes"] = macro["mes"].apply(lambda m: __import__("math").sin(2 * 3.14159 * m / 12))
 
-    # Lags de drivers
+    # Lags de drivers originales (mantenidos para compatibilidad con datos hist.)
     for col in ("trm", "brent", "ppi_usa"):
         if col in macro.columns:
             macro = agregar_lags_mensuales(macro, col, lags_meses=[1, 2, 3], col_fecha="fecha")
+
+    # Drivers ortogonales (ver docs/estudio_drivers_ipp.md)
+    # brent_cop = Brent_USD × TRM: precio del petróleo en pesos colombianos
+    # Elimina la multicolinealidad TRM~PPI_USA=0.80 / Brent~PPI_USA=0.82
+    if "brent" in macro.columns and "trm" in macro.columns:
+        macro["brent_cop"] = macro["brent"] * macro["trm"]
+        macro = agregar_lags_mensuales(macro, "brent_cop", lags_meses=[1, 2, 3], col_fecha="fecha")
+
+    # Variaciones anuales: ortogonales al nivel; mejor correlación con ipp_log_dif
+    macro = macro.sort_values("fecha").reset_index(drop=True)
+    if "trm" in macro.columns:
+        macro["trm_yoy"] = macro["trm"].pct_change(12) * 100
+        macro = agregar_lags_mensuales(macro, "trm_yoy", lags_meses=[1], col_fecha="fecha")
+    if "brent" in macro.columns:
+        macro["brent_yoy"] = macro["brent"].pct_change(12) * 100
+        macro = agregar_lags_mensuales(macro, "brent_yoy", lags_meses=[1], col_fecha="fecha")
 
     # ENSO con rezago 2 meses
     if df_oni is not None:
