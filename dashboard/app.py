@@ -1,28 +1,31 @@
-"""Dashboard de pronósticos — Precio de Bolsa e IPP Colombia.
+"""Dashboard de proyecciones — Precio de Bolsa e IPP Colombia.
 
 Ejecutar:
-    streamlit run dashboard/app.py
+    streamlit run dashboard/app.py     (desde la raiz del proyecto)
 
 Requiere streamlit y plotly instalados en el entorno activo.
-Los datos provienen de outputs/runs/{ultimo_ciclo}/.
+Los modelos se ajustan una vez por sesion desde los parquets de features.
+Los pronósticos historicos provienen de outputs/runs/{ultimo_ciclo}/.
 """
 
 from __future__ import annotations
 
+import io
 import json
+import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+warnings.filterwarnings("ignore")
+
 ROOT = Path(__file__).parent.parent
 RUNS = ROOT / "outputs" / "runs"
 PROCESSED = ROOT / "data" / "processed"
-
-# ---------------------------------------------------------------------------
-# Configuracion de la pagina
-# ---------------------------------------------------------------------------
+ESCENARIOS_DIR = ROOT / "outputs" / "escenarios"
 
 st.set_page_config(
     page_title="Proyecciones Energía Colombia",
@@ -30,8 +33,9 @@ st.set_page_config(
     layout="wide",
 )
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers: datos estáticos
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=300)
@@ -58,7 +62,7 @@ def _cargar_historico_diario() -> pd.DataFrame | None:
         return None
     df = pd.read_parquet(p)[["fecha", "precio_bolsa_mean"]].dropna()
     df["fecha"] = pd.to_datetime(df["fecha"])
-    return df.tail(180)  # ultimos 6 meses para el grafico
+    return df.tail(180)
 
 
 @st.cache_data(ttl=300)
@@ -98,6 +102,85 @@ def _color_escenario(esc: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helpers: modelos en vivo (cacheados por sesion — se ajustan una vez ~8s Bolsa / <1s IPP)
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _modelo_bolsa():
+    """Ajusta PronosticadorBolsa desde los parquets de features."""
+    p_feat = PROCESSED / "bolsa_features_diario.parquet"
+    if not p_feat.exists():
+        return None
+    from proybolsa.models.bolsa.pronostico import PronosticadorBolsa
+    df = pd.read_parquet(p_feat)
+    modelo = PronosticadorBolsa()
+    modelo.fit(df, ruta_perfil=str(PROCESSED / "perfil_horario.parquet"))
+    return modelo
+
+
+@st.cache_resource
+def _modelo_ipp():
+    """Ajusta PronosticadorIPP desde los parquets de features."""
+    p_feat = PROCESSED / "ipp_features_mensual.parquet"
+    if not p_feat.exists():
+        return None
+    df = pd.read_parquet(p_feat).dropna(subset=["ipp"])
+    if len(df) < 10:
+        return None
+    from proybolsa.models.ipp.modelo_ipp import PronosticadorIPP
+    modelo = PronosticadorIPP()
+    modelo.fit(df)
+    return modelo
+
+
+# ---------------------------------------------------------------------------
+# Helper: Excel export
+# ---------------------------------------------------------------------------
+
+def _escenarios_a_excel(escenarios: list[dict], modelo_label: str) -> bytes:
+    """Convierte lista de escenarios guardados a bytes de Excel."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # Hoja 1: resumen de supuestos
+        rows = []
+        for i, esc in enumerate(escenarios):
+            row = {"#": i + 1, "Nombre": esc["nombre"]}
+            row.update({f"Param: {k}": v for k, v in esc.get("params", {}).items()})
+            rows.append(row)
+        pd.DataFrame(rows).to_excel(writer, sheet_name="Supuestos", index=False)
+
+        # Hoja por escenario
+        for esc in escenarios:
+            nombre_hoja = esc["nombre"][:31]  # Excel limit
+            fc = esc["fc"].copy()
+            if "fecha" in fc.columns:
+                fc["fecha"] = pd.to_datetime(fc["fecha"]).dt.strftime("%Y-%m-%d")
+            fc.to_excel(writer, sheet_name=nombre_hoja, index=False)
+
+        # Hoja comparativa
+        if len(escenarios) > 1 and all("fc" in e for e in escenarios):
+            frames = []
+            for esc in escenarios:
+                fc = esc["fc"][["fecha", "pred"]].copy() if "pred" in esc["fc"].columns else esc["fc"][["fecha", "pred_diaria"]].copy()
+                fc.columns = ["fecha", esc["nombre"]]
+                frames.append(fc.set_index("fecha"))
+            comp = frames[0].join(frames[1:], how="outer")
+            comp.reset_index().to_excel(writer, sheet_name="Comparacion", index=False)
+
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Estado de sesion para escenarios guardados
+# ---------------------------------------------------------------------------
+
+if "escenarios_bolsa" not in st.session_state:
+    st.session_state.escenarios_bolsa = []
+if "escenarios_ipp" not in st.session_state:
+    st.session_state.escenarios_ipp = []
+
+
+# ---------------------------------------------------------------------------
 # Encabezado
 # ---------------------------------------------------------------------------
 
@@ -105,23 +188,21 @@ st.title("⚡ Proyecciones de Energía — Colombia")
 
 run_actual = _ultimo_run()
 if run_actual:
-    st.caption(f"Último ciclo: **{run_actual.name}**")
+    st.caption(f"Último ciclo mensual: **{run_actual.name}**  |  Modelos ajustados en vivo desde features parquet")
 else:
-    st.warning("No se encontraron datos. Ejecuta `run_monthly_update.py` primero.")
-    st.stop()
+    st.info("No se encontraron resultados de ciclos mensuales. Los modelos se ajustan directamente desde los parquets.")
 
-# Tabs principales
-tab_bolsa, tab_horario, tab_escenarios, tab_ipp, tab_precision = st.tabs([
+tab_bolsa, tab_horario, tab_esc_bolsa, tab_ipp, tab_precision = st.tabs([
     "Precio Bolsa (corto)",
     "Perfil Horario",
-    "Escenarios Hidrológicos",
-    "IPP",
-    "Seguimiento de Precisión",
+    "Escenarios Bolsa",
+    "IPP y Escenarios",
+    "Seguimiento de Precision",
 ])
 
 
 # ---------------------------------------------------------------------------
-# Tab 1: Pronóstico de bolsa corto plazo
+# Tab 1: Pronóstico de bolsa corto plazo (del ciclo mensual)
 # ---------------------------------------------------------------------------
 
 with tab_bolsa:
@@ -129,43 +210,32 @@ with tab_bolsa:
     df_fc = _cargar_df("pronostico_bolsa_corto_diario_*.parquet")
 
     if df_fc is None:
-        st.info("Sin pronostico corto disponible.")
+        st.info("Sin pronostico corto del ciclo mensual. Ejecuta `run_monthly_update.py`.")
     else:
         df_fc["fecha"] = pd.to_datetime(df_fc["fecha"])
-
         fig = go.Figure()
-
         if df_hist is not None:
             fig.add_trace(go.Scatter(
                 x=df_hist["fecha"], y=df_hist["precio_bolsa_mean"],
-                mode="lines", name="Histórico",
-                line={"color": "#444", "width": 1.5},
+                mode="lines", name="Historico", line={"color": "#444", "width": 1.5},
             ))
-
         fig.add_trace(go.Scatter(
             x=pd.concat([df_fc["fecha"], df_fc["fecha"][::-1]]),
             y=pd.concat([df_fc["ci_hi90"], df_fc["ci_lo90"][::-1]]),
             fill="toself", fillcolor="rgba(46,134,171,0.18)",
-            line={"color": "rgba(0,0,0,0)"}, showlegend=True,
-            name="IC 90%",
+            line={"color": "rgba(0,0,0,0)"}, showlegend=True, name="IC 90%",
         ))
         fig.add_trace(go.Scatter(
             x=df_fc["fecha"], y=df_fc["pred_diaria"],
-            mode="lines+markers", name="Pronóstico",
-            line={"color": "#2E86AB", "width": 2.5},
-            marker={"size": 6},
+            mode="lines+markers", name="Pronostico",
+            line={"color": "#2E86AB", "width": 2.5}, marker={"size": 6},
         ))
-
         fig.update_layout(
-            title="Precio de Bolsa Diario — Próximos 7 días",
-            xaxis_title="Fecha",
-            yaxis_title="COP/kWh",
-            hovermode="x unified",
-            legend={"orientation": "h", "y": -0.15},
-            height=420,
+            title="Precio de Bolsa Diario - Proximos 7 dias",
+            xaxis_title="Fecha", yaxis_title="COP/kWh",
+            hovermode="x unified", legend={"orientation": "h", "y": -0.15}, height=420,
         )
         st.plotly_chart(fig, use_container_width=True)
-
         col1, col2, col3 = st.columns(3)
         col1.metric("Promedio 7d", f"{df_fc['pred_diaria'].mean():.0f} COP/kWh")
         col2.metric("Min", f"{df_fc['pred_diaria'].min():.0f}")
@@ -173,13 +243,13 @@ with tab_bolsa:
 
     resumen = _cargar_resumen()
     if resumen:
-        with st.expander("Diagnóstico del modelo"):
+        with st.expander("Diagnostico del modelo"):
             col1, col2 = st.columns(2)
             col1.metric("Peso SARIMAX", f"{resumen.get('w_sarimax', 0):.1%}")
             col1.metric("Peso LGB", f"{resumen.get('w_lgb', 0):.1%}")
-            col1.metric("AIC SARIMAX", resumen.get("aic_sarimax", "—"))
-            col2.metric("Días de entrenamiento", resumen.get("n_train", "—"))
-            col2.metric("Celdas del perfil", resumen.get("perfil_celdas", "—"))
+            col1.metric("AIC SARIMAX", resumen.get("aic_sarimax", ""))
+            col2.metric("Dias entrenamiento", resumen.get("n_train", ""))
+            col2.metric("Celdas del perfil", resumen.get("perfil_celdas", ""))
             top = resumen.get("top_features_lgb", {})
             if top:
                 st.caption("**Top features LGB (gain)**")
@@ -197,29 +267,28 @@ with tab_horario:
     df_perf = _cargar_perfil()
     df_fc_h = _cargar_df("pronostico_bolsa_corto_horario_*.parquet")
 
-    if df_perf is None:
-        st.info("Sin perfil horario disponible.")
-    else:
-        # Mapa de calor: tipo_dia x hora -> factor
-        tipo_dias = sorted(df_perf["tipo_dia"].unique())
-        pivot = df_perf.pivot_table(values="factor", index="tipo_dia", columns="hora", aggfunc="mean")
-
-        fig_heatmap = go.Figure(go.Heatmap(
-            z=pivot.values,
-            x=list(pivot.columns),
-            y=list(pivot.index),
-            colorscale="RdYlGn",
-            text=[[f"{v:.2f}" for v in row] for row in pivot.values],
-            texttemplate="%{text}",
-            colorbar={"title": "Factor"},
-        ))
-        fig_heatmap.update_layout(
-            title="Perfil Horario (factor multiplicador sobre nivel diario)",
-            xaxis_title="Hora del día",
-            yaxis_title="Tipo de día",
-            height=280,
+    if df_perf is not None:
+        col_factor = "perfil_medio" if "perfil_medio" in df_perf.columns else (
+            "factor" if "factor" in df_perf.columns else None
         )
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+        if col_factor:
+            pivot = df_perf.pivot_table(values=col_factor, index="tipo_dia", columns="hora", aggfunc="mean")
+            fig_heatmap = go.Figure(go.Heatmap(
+                z=pivot.values, x=list(pivot.columns), y=list(pivot.index),
+                colorscale="RdYlGn",
+                text=[[f"{v:.2f}" for v in row] for row in pivot.values],
+                texttemplate="%{text}",
+                colorbar={"title": "Factor"},
+            ))
+            fig_heatmap.update_layout(
+                title="Perfil Horario (factor multiplicador sobre nivel diario)",
+                xaxis_title="Hora del dia", yaxis_title="Tipo de dia", height=280,
+            )
+            st.plotly_chart(fig_heatmap, use_container_width=True)
+        else:
+            st.info("Columna de factor no encontrada en perfil.")
+    else:
+        st.info("Sin perfil horario disponible.")
 
     if df_fc_h is not None:
         df_fc_h["timestamp"] = pd.to_datetime(df_fc_h["timestamp"])
@@ -235,13 +304,12 @@ with tab_horario:
         ))
         fig_h.add_trace(go.Scatter(
             x=df_fc_h["timestamp"], y=df_fc_h["pred_horaria"],
-            mode="lines", name="Pronóstico horario",
+            mode="lines", name="Pronostico horario",
             line={"color": "#2E86AB", "width": 1.5},
         ))
         fig_h.update_layout(
-            title="Precio Horario — Próximas 168 horas",
-            xaxis_title="Timestamp",
-            yaxis_title="COP/kWh",
+            title="Precio Horario - Proximas 168 horas",
+            xaxis_title="Timestamp", yaxis_title="COP/kWh",
             height=360, hovermode="x unified",
             legend={"orientation": "h", "y": -0.15},
         )
@@ -249,117 +317,392 @@ with tab_horario:
 
 
 # ---------------------------------------------------------------------------
-# Tab 3: Escenarios hidrológicos (30d)
+# Tab 3: Escenarios Bolsa (INTERACTIVO)
 # ---------------------------------------------------------------------------
 
-with tab_escenarios:
-    df_tac = _cargar_df("pronostico_bolsa_tactico_*.parquet")
+with tab_esc_bolsa:
+    st.subheader("Constructor de escenarios — Precio de Bolsa")
+    st.caption(
+        "Define los supuestos hidrologicos y macroeconómicos. "
+        "El modelo se recalcula en <1 segundo sobre los datos mas recientes."
+    )
 
-    if df_tac is None:
-        st.info("Sin pronostico táctico disponible.")
+    modelo_b = _modelo_bolsa()
+
+    if modelo_b is None:
+        st.warning("No se pudo ajustar el modelo de bolsa. Verifica que `bolsa_features_diario.parquet` exista.")
     else:
-        df_tac["fecha"] = pd.to_datetime(df_tac["fecha"])
-        fig_esc = go.Figure()
+        # --- Panel de supuestos ---
+        with st.form("form_bolsa"):
+            c1, c2, c3 = st.columns(3)
 
-        for esc in ["seco", "promedio", "humedo"]:
-            sub = df_tac[df_tac["escenario"] == esc]
-            color = _color_escenario(esc)
-            fig_esc.add_trace(go.Scatter(
-                x=sub["fecha"], y=sub["pred_diaria"],
-                mode="lines", name=esc.capitalize(),
-                line={"color": color, "width": 2},
+            with c1:
+                aportes = st.slider(
+                    "Aportes hídricos (% del promedio histórico)", 40, 160, 100, step=5,
+                    help="100 = normal, <80 = seco, >120 = húmedo",
+                )
+                volumen = st.slider(
+                    "Volumen útil embalses (% de capacidad)", 20, 90, 60, step=5,
+                )
+
+            with c2:
+                oni = st.slider(
+                    "ONI asumido (ENSO)", -2.0, 2.5, 0.0, step=0.1,
+                    help=">0.5 = El Niño (precios altos), <-0.5 = La Niña (precios bajos)",
+                )
+                escasez = st.slider(
+                    "Precio de escasez (COP/kWh)", 800, 1200, 906, step=10,
+                )
+
+            with c3:
+                horizonte_b = st.selectbox("Horizonte de pronóstico", [7, 30, 365], index=1,
+                                           format_func=lambda h: f"{h} días")
+                nombre_esc_b = st.text_input("Nombre del escenario", value="Escenario 1")
+
+            submitted_b = st.form_submit_button("Calcular escenario", type="primary")
+
+        if submitted_b or st.session_state.get("_bolsa_recalc"):
+            with st.spinner("Calculando..."):
+                fc_b = modelo_b.pronosticar(
+                    horizonte_b,
+                    aportes_pct=float(aportes),
+                    volumen_util_pct=float(volumen),
+                    oni_asumido=float(oni),
+                    precio_escasez=float(escasez),
+                    devolver_horario=False,
+                )
+                fc_b["fecha"] = pd.to_datetime(fc_b["fecha"])
+            st.session_state["_ultimo_fc_bolsa"] = fc_b
+            st.session_state["_ultimo_params_bolsa"] = {
+                "aportes_pct": aportes, "volumen_util_pct": volumen,
+                "oni": oni, "escasez": escasez, "horizonte_dias": horizonte_b,
+            }
+
+        fc_b_actual = st.session_state.get("_ultimo_fc_bolsa")
+
+        if fc_b_actual is not None:
+            fig_b = go.Figure()
+
+            # Histórico
+            df_hist = _cargar_historico_diario()
+            if df_hist is not None:
+                fig_b.add_trace(go.Scatter(
+                    x=df_hist["fecha"], y=df_hist["precio_bolsa_mean"],
+                    mode="lines", name="Historico", line={"color": "#888", "width": 1.5},
+                ))
+
+            # Escenarios guardados (superpuestos)
+            colores_saved = ["#E05252", "#44BBA4", "#F4A261", "#A663CC", "#2D6A4F"]
+            for i, esc_g in enumerate(st.session_state.escenarios_bolsa):
+                c = colores_saved[i % len(colores_saved)]
+                fig_b.add_trace(go.Scatter(
+                    x=esc_g["fc"]["fecha"], y=esc_g["fc"]["pred_diaria"],
+                    mode="lines", name=esc_g["nombre"],
+                    line={"color": c, "width": 1.5, "dash": "dot"},
+                ))
+
+            # Escenario actual
+            fig_b.add_trace(go.Scatter(
+                x=pd.concat([fc_b_actual["fecha"], fc_b_actual["fecha"][::-1]]),
+                y=pd.concat([fc_b_actual["ci_hi90"], fc_b_actual["ci_lo90"][::-1]]),
+                fill="toself", fillcolor="rgba(46,134,171,0.18)",
+                line={"color": "rgba(0,0,0,0)"}, showlegend=True, name="IC 90%",
             ))
-            fig_esc.add_trace(go.Scatter(
-                x=pd.concat([sub["fecha"], sub["fecha"][::-1]]),
-                y=pd.concat([sub["ci_hi90"], sub["ci_lo90"][::-1]]),
-                fill="toself",
-                fillcolor=color.replace(")", ",0.12)").replace("rgb", "rgba") if "rgb" in color
-                          else f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.12)",
-                line={"color": "rgba(0,0,0,0)"},
-                showlegend=False,
+            fig_b.add_trace(go.Scatter(
+                x=fc_b_actual["fecha"], y=fc_b_actual["pred_diaria"],
+                mode="lines+markers", name="Actual",
+                line={"color": "#2E86AB", "width": 2.5}, marker={"size": 5},
             ))
+            fig_b.update_layout(
+                title=f"Escenario de Bolsa — {horizonte_b} dias",
+                xaxis_title="Fecha", yaxis_title="COP/kWh",
+                hovermode="x unified", height=400,
+                legend={"orientation": "h", "y": -0.18},
+            )
+            st.plotly_chart(fig_b, use_container_width=True)
 
-        fig_esc.update_layout(
-            title="Escenarios Hidrológicos — Próximos 30 días",
-            xaxis_title="Fecha",
-            yaxis_title="COP/kWh",
-            hovermode="x unified",
-            height=420,
-            legend={"orientation": "h", "y": -0.15},
-        )
-        st.plotly_chart(fig_esc, use_container_width=True)
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Promedio", f"{fc_b_actual['pred_diaria'].mean():.0f} COP/kWh")
+            col_m2.metric("Min", f"{fc_b_actual['pred_diaria'].min():.0f}")
+            col_m3.metric("Max", f"{fc_b_actual['pred_diaria'].max():.0f}")
+            col_m4.metric("IC ancho (prom.)", f"{(fc_b_actual['ci_hi90'] - fc_b_actual['ci_lo90']).mean():.0f}")
 
-        # Tabla resumen
-        resumen_esc = df_tac.groupby("escenario")["pred_diaria"].agg(
-            Media="mean", Min="min", Max="max"
-        ).round(0).reset_index()
-        resumen_esc.columns = ["Escenario", "Promedio (COP/kWh)", "Min", "Max"]
-        st.dataframe(resumen_esc, use_container_width=True, hide_index=True)
+        # --- Guardar y comparar ---
+        st.divider()
+        col_g1, col_g2, col_g3 = st.columns([2, 1, 1])
 
-    # Largo plazo (365d)
-    df_largo = _cargar_df("pronostico_bolsa_largo_*.parquet")
-    if df_largo is not None:
-        df_largo["fecha"] = pd.to_datetime(df_largo["fecha"])
-        fig_largo = go.Figure()
-        for esc in ["seco", "promedio", "humedo"]:
-            sub = df_largo[df_largo["escenario"] == esc]
-            sub_agg = sub.resample("ME", on="fecha")["pred_diaria"].mean().reset_index()
-            fig_largo.add_trace(go.Scatter(
-                x=sub_agg["fecha"], y=sub_agg["pred_diaria"],
-                mode="lines+markers", name=esc.capitalize(),
-                line={"color": _color_escenario(esc)},
-            ))
-        fig_largo.update_layout(
-            title="Proyección a 12 meses — Media mensual por escenario",
-            xaxis_title="Mes", yaxis_title="COP/kWh",
-            hovermode="x unified", height=360,
-            legend={"orientation": "h", "y": -0.15},
-        )
-        st.plotly_chart(fig_largo, use_container_width=True)
+        with col_g1:
+            if st.button("Guardar escenario actual", disabled=fc_b_actual is None):
+                params_b = st.session_state.get("_ultimo_params_bolsa", {})
+                st.session_state.escenarios_bolsa.append({
+                    "nombre": nombre_esc_b,
+                    "params": params_b,
+                    "fc": fc_b_actual.copy(),
+                })
+                st.success(f"Escenario '{nombre_esc_b}' guardado.")
+                st.rerun()
+
+        with col_g2:
+            if st.button("Limpiar comparacion", disabled=not st.session_state.escenarios_bolsa):
+                st.session_state.escenarios_bolsa = []
+                st.rerun()
+
+        with col_g3:
+            if st.session_state.escenarios_bolsa:
+                xlsx_bytes = _escenarios_a_excel(st.session_state.escenarios_bolsa, "bolsa")
+                st.download_button(
+                    "Exportar a Excel",
+                    data=xlsx_bytes,
+                    file_name="escenarios_bolsa.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        if st.session_state.escenarios_bolsa:
+            st.subheader("Escenarios guardados")
+            rows_g = []
+            for esc_g in st.session_state.escenarios_bolsa:
+                p = esc_g.get("params", {})
+                rows_g.append({
+                    "Nombre": esc_g["nombre"],
+                    "Aportes (%)": p.get("aportes_pct", ""),
+                    "Volumen (%)": p.get("volumen_util_pct", ""),
+                    "ONI": p.get("oni", ""),
+                    "Escasez": p.get("escasez", ""),
+                    "Horizonte (d)": p.get("horizonte_dias", ""),
+                    "Prom. COP/kWh": f"{esc_g['fc']['pred_diaria'].mean():.0f}",
+                })
+            st.dataframe(pd.DataFrame(rows_g), use_container_width=True, hide_index=True)
+
+        # --- Escenarios hidrologicos estaticos (del ciclo mensual) ---
+        st.divider()
+        st.subheader("Escenarios hidrológicos del ciclo mensual (30 días)")
+        df_tac = _cargar_df("pronostico_bolsa_tactico_*.parquet")
+        if df_tac is not None:
+            df_tac["fecha"] = pd.to_datetime(df_tac["fecha"])
+            fig_esc = go.Figure()
+            for esc in ["seco", "promedio", "humedo"]:
+                sub = df_tac[df_tac["escenario"] == esc] if "escenario" in df_tac.columns else df_tac
+                if len(sub) == 0:
+                    continue
+                color = _color_escenario(esc)
+                fig_esc.add_trace(go.Scatter(
+                    x=sub["fecha"], y=sub["pred_diaria"],
+                    mode="lines", name=esc.capitalize(),
+                    line={"color": color, "width": 2},
+                ))
+            fig_esc.update_layout(
+                title="Escenarios Hidrologicos — 30 dias (ciclo mensual)",
+                xaxis_title="Fecha", yaxis_title="COP/kWh",
+                hovermode="x unified", height=360,
+                legend={"orientation": "h", "y": -0.15},
+            )
+            st.plotly_chart(fig_esc, use_container_width=True)
+        else:
+            st.info("Ejecutar `run_monthly_update.py` para ver pronósticos del ciclo mensual.")
 
 
 # ---------------------------------------------------------------------------
-# Tab 4: IPP
+# Tab 4: IPP (histórico + constructor interactivo de escenarios)
 # ---------------------------------------------------------------------------
 
 with tab_ipp:
+    # --- Histórico + pronóstico del ciclo mensual ---
+    st.subheader("IPP Colombia — Histórico y Pronóstico Base")
     df_hist_ipp = _cargar_historico_ipp()
     df_fc_ipp = _cargar_df("pronostico_ipp_12m_*.parquet")
 
-    if df_fc_ipp is None and df_hist_ipp is None:
+    fig_ipp = go.Figure()
+    if df_hist_ipp is not None:
+        fig_ipp.add_trace(go.Scatter(
+            x=df_hist_ipp["fecha"], y=df_hist_ipp["ipp"],
+            mode="lines", name="Historico IPP",
+            line={"color": "#444", "width": 1.5},
+        ))
+    if df_fc_ipp is not None:
+        df_fc_ipp["fecha"] = pd.to_datetime(df_fc_ipp["fecha"])
+        fig_ipp.add_trace(go.Scatter(
+            x=pd.concat([df_fc_ipp["fecha"], df_fc_ipp["fecha"][::-1]]),
+            y=pd.concat([df_fc_ipp["ci_hi90"], df_fc_ipp["ci_lo90"][::-1]]),
+            fill="toself", fillcolor="rgba(68,187,164,0.18)",
+            line={"color": "rgba(0,0,0,0)"}, showlegend=True, name="IC 90%",
+        ))
+        fig_ipp.add_trace(go.Scatter(
+            x=df_fc_ipp["fecha"], y=df_fc_ipp["pred"],
+            mode="lines+markers", name="Pronostico base IPP",
+            line={"color": "#44BBA4", "width": 2.5}, marker={"size": 6},
+        ))
+    if df_hist_ipp is None and df_fc_ipp is None:
         st.info("Sin datos IPP. Cargar `data/raw/macro/ipp_manual.csv` y ejecutar `construir_features.py`.")
     else:
-        fig_ipp = go.Figure()
-
-        if df_hist_ipp is not None:
-            fig_ipp.add_trace(go.Scatter(
-                x=df_hist_ipp["fecha"], y=df_hist_ipp["ipp"],
-                mode="lines", name="Histórico IPP",
-                line={"color": "#444", "width": 1.5},
-            ))
-
-        if df_fc_ipp is not None:
-            df_fc_ipp["fecha"] = pd.to_datetime(df_fc_ipp["fecha"])
-            fig_ipp.add_trace(go.Scatter(
-                x=pd.concat([df_fc_ipp["fecha"], df_fc_ipp["fecha"][::-1]]),
-                y=pd.concat([df_fc_ipp["ci_hi90"], df_fc_ipp["ci_lo90"][::-1]]),
-                fill="toself", fillcolor="rgba(68,187,164,0.18)",
-                line={"color": "rgba(0,0,0,0)"}, showlegend=True, name="IC 90%",
-            ))
-            fig_ipp.add_trace(go.Scatter(
-                x=df_fc_ipp["fecha"], y=df_fc_ipp["pred"],
-                mode="lines+markers", name="Pronóstico IPP",
-                line={"color": "#44BBA4", "width": 2.5},
-                marker={"size": 6},
-            ))
-
         fig_ipp.update_layout(
-            title="IPP Colombia — Histórico y Pronóstico 12 meses",
-            xaxis_title="Fecha", yaxis_title="Índice (base dic-2014=100)",
-            hovermode="x unified", height=420,
+            title="IPP Colombia — Historico y Pronostico 12 meses (base)",
+            xaxis_title="Fecha", yaxis_title="Indice (base dic-2014=100)",
+            hovermode="x unified", height=380,
             legend={"orientation": "h", "y": -0.15},
         )
         st.plotly_chart(fig_ipp, use_container_width=True)
+
+    # --- Constructor de escenarios IPP ---
+    st.divider()
+    st.subheader("Constructor de escenarios — IPP")
+    st.caption(
+        "Define trayectorias de TRM y Brent. "
+        "El efecto sobre el IPP es modesto en el corto plazo (IPP es autoregresivo); "
+        "el impacto se acumula gradualmente en horizontes de 12-24 meses."
+    )
+
+    modelo_i = _modelo_ipp()
+
+    if modelo_i is None:
+        st.warning("No se pudo ajustar el modelo IPP. Verifica que `ipp_features_mensual.parquet` exista y tenga datos de IPP.")
+    else:
+        with st.form("form_ipp"):
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+                trm_var = st.slider(
+                    "Variacion TRM anual (%)",
+                    -20, 50, 0, step=2,
+                    help="Positivo = depreciacion del peso (TRM sube). Afecta costo de insumos importados.",
+                )
+                brent_var = st.slider(
+                    "Variacion Brent anual (%)",
+                    -30, 50, 0, step=2,
+                    help="Variacion anual del precio del petroleo en USD/barril.",
+                )
+
+            with c2:
+                oni_i = st.slider(
+                    "ONI asumido (ENSO)", -2.0, 2.5, 0.0, step=0.1,
+                    help=">0.5 = El Niño activo",
+                )
+                horizonte_i = st.selectbox(
+                    "Horizonte de pronostico", [12, 24], index=0,
+                    format_func=lambda h: f"{h} meses",
+                )
+
+            with c3:
+                nombre_esc_i = st.text_input("Nombre del escenario", value="Escenario IPP 1", key="nombre_ipp")
+
+            submitted_i = st.form_submit_button("Calcular escenario IPP", type="primary")
+
+        if submitted_i:
+            with st.spinner("Calculando IPP..."):
+                fut = modelo_i.construir_futuro_drivers(
+                    horizonte_i,
+                    trm_var_anual=trm_var / 100,
+                    brent_var_anual=brent_var / 100,
+                    oni=float(oni_i),
+                )
+                fc_i = modelo_i.pronosticar(horizonte_i, df_futuro=fut)
+                fc_i["fecha"] = pd.to_datetime(fc_i["fecha"])
+            st.session_state["_ultimo_fc_ipp"] = fc_i
+            st.session_state["_ultimo_params_ipp"] = {
+                "trm_var_anual_pct": trm_var, "brent_var_anual_pct": brent_var,
+                "oni": oni_i, "horizonte_meses": horizonte_i,
+            }
+
+        fc_i_actual = st.session_state.get("_ultimo_fc_ipp")
+
+        if fc_i_actual is not None:
+            fig_i = go.Figure()
+
+            # Histórico
+            if df_hist_ipp is not None:
+                fig_i.add_trace(go.Scatter(
+                    x=df_hist_ipp["fecha"], y=df_hist_ipp["ipp"],
+                    mode="lines", name="Historico", line={"color": "#888", "width": 1.5},
+                ))
+
+            # Escenarios guardados (superpuestos)
+            colores_i = ["#E05252", "#F4A261", "#A663CC", "#2D6A4F", "#E76F51"]
+            for idx_g, esc_g in enumerate(st.session_state.escenarios_ipp):
+                c = colores_i[idx_g % len(colores_i)]
+                fig_i.add_trace(go.Scatter(
+                    x=esc_g["fc"]["fecha"], y=esc_g["fc"]["pred"],
+                    mode="lines", name=esc_g["nombre"],
+                    line={"color": c, "width": 1.5, "dash": "dot"},
+                ))
+
+            # Escenario actual
+            fig_i.add_trace(go.Scatter(
+                x=pd.concat([fc_i_actual["fecha"], fc_i_actual["fecha"][::-1]]),
+                y=pd.concat([fc_i_actual["ci_hi90"], fc_i_actual["ci_lo90"][::-1]]),
+                fill="toself", fillcolor="rgba(68,187,164,0.20)",
+                line={"color": "rgba(0,0,0,0)"}, showlegend=True, name="IC 90%",
+            ))
+            fig_i.add_trace(go.Scatter(
+                x=fc_i_actual["fecha"], y=fc_i_actual["pred"],
+                mode="lines+markers", name="Escenario actual",
+                line={"color": "#44BBA4", "width": 2.5}, marker={"size": 6},
+            ))
+            fig_i.update_layout(
+                title="IPP — Escenario interactivo",
+                xaxis_title="Fecha", yaxis_title="Indice (base dic-2014=100)",
+                hovermode="x unified", height=400,
+                legend={"orientation": "h", "y": -0.18},
+            )
+            st.plotly_chart(fig_i, use_container_width=True)
+
+            col_m1, col_m2, col_m3 = st.columns(3)
+            ultimo = fc_i_actual["pred"].iloc[-1]
+            primero = fc_i_actual["pred"].iloc[0]
+            col_m1.metric("IPP mes 1", f"{primero:.2f}")
+            col_m2.metric(f"IPP mes {horizonte_i}", f"{ultimo:.2f}")
+            col_m3.metric("Variacion acumulada", f"{(ultimo/primero - 1)*100:+.1f}%")
+
+            # Tabla detallada
+            with st.expander("Ver tabla de pronostico"):
+                tbl = fc_i_actual[["fecha", "pred", "ci_lo90", "ci_hi90"]].copy()
+                tbl.columns = ["Fecha", "Pred. IPP", "IC Lo 90%", "IC Hi 90%"]
+                tbl = tbl.set_index("Fecha").round(2)
+                st.dataframe(tbl, use_container_width=True)
+
+        # --- Guardar y comparar ---
+        st.divider()
+        col_g1, col_g2, col_g3 = st.columns([2, 1, 1])
+
+        with col_g1:
+            if st.button("Guardar escenario IPP", disabled=fc_i_actual is None, key="btn_guardar_ipp"):
+                params_i = st.session_state.get("_ultimo_params_ipp", {})
+                st.session_state.escenarios_ipp.append({
+                    "nombre": nombre_esc_i,
+                    "params": params_i,
+                    "fc": fc_i_actual.copy(),
+                })
+                st.success(f"Escenario IPP '{nombre_esc_i}' guardado.")
+                st.rerun()
+
+        with col_g2:
+            if st.button("Limpiar comparacion IPP", disabled=not st.session_state.escenarios_ipp, key="btn_limpiar_ipp"):
+                st.session_state.escenarios_ipp = []
+                st.rerun()
+
+        with col_g3:
+            if st.session_state.escenarios_ipp:
+                xlsx_i_bytes = _escenarios_a_excel(st.session_state.escenarios_ipp, "ipp")
+                st.download_button(
+                    "Exportar a Excel",
+                    data=xlsx_i_bytes,
+                    file_name="escenarios_ipp.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="btn_export_ipp",
+                )
+
+        if st.session_state.escenarios_ipp:
+            st.subheader("Escenarios IPP guardados")
+            rows_i = []
+            for esc_g in st.session_state.escenarios_ipp:
+                p = esc_g.get("params", {})
+                rows_i.append({
+                    "Nombre": esc_g["nombre"],
+                    "TRM var. anual (%)": p.get("trm_var_anual_pct", ""),
+                    "Brent var. anual (%)": p.get("brent_var_anual_pct", ""),
+                    "ONI": p.get("oni", ""),
+                    "Horizonte (m)": p.get("horizonte_meses", ""),
+                    f"IPP ultimo mes": f"{esc_g['fc']['pred'].iloc[-1]:.2f}",
+                })
+            st.dataframe(pd.DataFrame(rows_i), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -371,12 +714,12 @@ with tab_precision:
     errores = resumen.get("errores_ciclo_anterior", [])
 
     if not errores:
-        st.info("Sin errores registrados aún — aparecerán a partir del segundo ciclo mensual.")
+        st.info("Sin errores registrados aun — apareceran a partir del segundo ciclo mensual.")
         st.markdown("""
-        **¿Cómo funciona el seguimiento?**
+        **Como funciona el seguimiento:**
 
         Cada vez que `run_monthly_update.py` se ejecuta:
-        1. Compara los pronósticos del mes anterior contra los precios realizados
+        1. Compara los pronosticos del mes anterior contra los precios realizados
         2. Calcula MAE, RMSE y sesgo por horizonte
         3. Actualiza los pesos del ensemble para compensar el sesgo reciente
         4. Registra el error en `outputs/runs/{YYYY-MM}/resumen_bolsa.json`
@@ -384,19 +727,14 @@ with tab_precision:
     else:
         df_err = pd.DataFrame(errores)
         st.subheader("Error del ciclo anterior")
+        cols_disp = [c for c in ["horizonte", "n_obs", "mae", "rmse", "sesgo", "mape_pct"] if c in df_err.columns]
+        rename_map = {"horizonte": "Horizonte (d)", "n_obs": "N obs", "mae": "MAE",
+                      "rmse": "RMSE", "sesgo": "Sesgo", "mape_pct": "MAPE %"}
         st.dataframe(
-            df_err[["horizonte", "n_obs", "mae", "rmse", "sesgo", "mape_pct"]].rename(columns={
-                "horizonte": "Horizonte (d)",
-                "n_obs": "N obs",
-                "mae": "MAE (COP/kWh)",
-                "rmse": "RMSE (COP/kWh)",
-                "sesgo": "Sesgo (pred−real)",
-                "mape_pct": "MAPE %",
-            }).round(1),
+            df_err[cols_disp].rename(columns=rename_map).round(1),
             use_container_width=True, hide_index=True,
         )
 
-    # Historial de todos los ciclos
     all_resumenes = []
     for run_path in sorted(RUNS.glob("*/resumen_bolsa.json")):
         try:
@@ -408,16 +746,16 @@ with tab_precision:
             pass
 
     if len(all_resumenes) > 1:
-        st.subheader("Evolución de pesos del ensemble")
+        st.subheader("Evolucion de pesos del ensemble")
         df_pesos = pd.DataFrame([
             {"periodo": r["periodo"], "SARIMAX": r.get("w_sarimax", 0), "LGB": r.get("w_lgb", 0)}
             for r in all_resumenes
         ])
         fig_pesos = go.Figure()
-        for modelo in ["SARIMAX", "LGB"]:
+        for modelo_lbl in ["SARIMAX", "LGB"]:
             fig_pesos.add_trace(go.Scatter(
-                x=df_pesos["periodo"], y=df_pesos[modelo],
-                mode="lines+markers", name=modelo,
+                x=df_pesos["periodo"], y=df_pesos[modelo_lbl],
+                mode="lines+markers", name=modelo_lbl,
             ))
         fig_pesos.update_layout(
             title="Pesos del ensemble por ciclo mensual",
@@ -426,7 +764,7 @@ with tab_precision:
         )
         st.plotly_chart(fig_pesos, use_container_width=True)
 
-    st.subheader("Referencia: Backtest rolling-origin (62 orígenes)")
+    st.subheader("Referencia: Backtest rolling-origin (62 origenes)")
     st.markdown("""
     | Horizonte | RMSE ensemble | RMSE naive | Sesgo |
     |-----------|:---:|:---:|:---:|
@@ -435,7 +773,7 @@ with tab_precision:
     | 14d | 496 | 321 | +130 |
     | 30d | 844 | 348 | +262 |
 
-    > **Nota:** El sesgo positivo refleja la transición del régimen El Niño 2023-2024
-    > (precio ~800–2000 COP/kWh) al período post-Niño 2025-2026 (~465 COP/kWh).
+    > **Nota:** El sesgo positivo refleja la transicion del regimen El Nino 2023-2024
+    > (precio ~800-2000 COP/kWh) al periodo post-Nino 2025-2026 (~465 COP/kWh).
     > El loop mensual lo corrige gradualmente via `actualizar_sesgo()`.
     """)
