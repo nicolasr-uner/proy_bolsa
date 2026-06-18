@@ -1,0 +1,30 @@
+# requirements.txt — Dashboard proyecciones energía Colombia
+# Instalar: pip install -r requirements.txt
+#
+# Divide en dos grupos:
+#   A) Dependencias del dashboard (Streamlit + visualización)
+#   B) Dependencias de los modelos (stats + ML)
+#
+# Python >= 3.11 requerido (uv: python = ">=3.11")
+
+# --- A) Dashboard ---
+streamlit==1.55.0
+plotly==6.6.0
+openpyxl==3.1.5
+
+# --- B) Modelos ---
+pandas==2.3.3
+numpy==2.4.3
+statsmodels==0.14.6
+lightgbm==4.6.0
+pandera==0.31.1
+
+# --- C) Ingesta (solo para run_monthly_update.py, no necesario para el dashboard) ---
+# pydataxm>=0.4
+# pandas-datareader>=0.10
+# fredapi>=0.5
+# requests>=2.31
+
+# --- Nota de entorno ---
+# El dashboard corre con el Python del sistema (C:\Users\Lenovo\AppData\Local\Python\)
+# El ciclo mensual corre con el venv de uv (.venv\) que tiene pydataxm y pydantic
