@@ -44,20 +44,25 @@ def _construir_df_futuro(
     precio_escasez: float = 906.0,
     oni_asumido: float = 0.0,
     df_referencia: pd.DataFrame | None = None,
+    aportes_pct: float | None = None,
+    volumen_util_pct: float | None = None,
 ) -> pd.DataFrame:
     """Construye un DataFrame de drivers futuros para el pronostico.
 
     Si df_referencia se provee, toma la ultima fila disponible para propagar
     los drivers observados mas recientes. Si no, usa los valores del escenario.
+
+    aportes_pct / volumen_util_pct: si se pasan, sobreescriben el preset del
+    escenario (usado por el dashboard interactivo para hidrologia arbitraria).
     """
     fechas = pd.date_range(fecha_inicio, periods=horizonte_dias, freq="D")
     df = pd.DataFrame({"fecha": fechas.date})
     df = agregar_features_fecha(df)
 
-    # Hidrologia por escenario
+    # Hidrologia: preset del escenario, con override opcional desde sliders
     hidro = ESCENARIOS_HIDRO.get(escenario, ESCENARIOS_HIDRO["promedio"])
-    df["aportes_pct"] = hidro["aportes_pct"]
-    df["volumen_util_pct"] = hidro["volumen_util_pct"]
+    df["aportes_pct"] = aportes_pct if aportes_pct is not None else hidro["aportes_pct"]
+    df["volumen_util_pct"] = volumen_util_pct if volumen_util_pct is not None else hidro["volumen_util_pct"]
     df["precio_escasez"] = precio_escasez
 
     # ENSO
@@ -158,6 +163,8 @@ class PronosticadorBolsa:
         oni_asumido: float = 0.0,
         escenarios_multiples: bool = False,
         devolver_horario: bool = True,
+        aportes_pct: float | None = None,
+        volumen_util_pct: float | None = None,
     ) -> pd.DataFrame | dict[str, pd.DataFrame]:
         """Genera el pronostico para los proximos `horizonte_dias` dias.
 
@@ -170,6 +177,8 @@ class PronosticadorBolsa:
         oni_asumido         : Valor de ONI asumido para el horizonte
         escenarios_multiples: Si True, calcula los 3 escenarios y devuelve un dict
         devolver_horario    : Si True (default), expande a 24h usando perfil
+        aportes_pct         : Override de hidrologia (sliders del dashboard); None usa el preset
+        volumen_util_pct    : Override de volumen util; None usa el preset
 
         Returns
         -------
@@ -207,6 +216,8 @@ class PronosticadorBolsa:
             precio_escasez=precio_escasez,
             oni_asumido=oni_asumido,
             df_referencia=self._df_train,
+            aportes_pct=aportes_pct,
+            volumen_util_pct=volumen_util_pct,
         )
 
         # Pronostico del nivel diario

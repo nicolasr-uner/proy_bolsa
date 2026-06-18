@@ -243,3 +243,24 @@ class TestPronosticadorBolsa:
         df_train. df_val solo calibra pesos; el forecast debe partir del ultimo dato."""
         n_full = len(_df_diario_sintetico(400))
         assert int(modelo_ajustado.modelo.sarimax._result.nobs) == n_full
+
+    def test_pronosticar_acepta_override_hidrologia(self, modelo_ajustado):
+        """El dashboard pasa hidrologia arbitraria (sliders), no solo los 3 presets."""
+        fc = modelo_ajustado.pronosticar(
+            14, aportes_pct=50.0, volumen_util_pct=30.0, devolver_horario=False
+        )
+        assert len(fc) == 14
+        assert "pred_diaria" in fc.columns
+
+
+def test_construir_df_futuro_override_hidrologia():
+    """aportes_pct/volumen_util_pct explicitos sobreescriben el preset del escenario."""
+    df_futuro = _construir_df_futuro(
+        horizonte_dias=10,
+        fecha_inicio=pd.Timestamp("2026-07-01"),
+        escenario="promedio",
+        aportes_pct=42.0,
+        volumen_util_pct=33.0,
+    )
+    assert (df_futuro["aportes_pct"] == 42.0).all()
+    assert (df_futuro["volumen_util_pct"] == 33.0).all()
