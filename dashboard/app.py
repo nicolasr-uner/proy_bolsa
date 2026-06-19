@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import warnings
 from pathlib import Path
 
@@ -25,6 +26,9 @@ warnings.filterwarnings("ignore", category=UserWarning, module="statsmodels")
 warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
 
 ROOT = Path(__file__).parent.parent
+# Necesario en Streamlit Community Cloud donde no hay editable install de proybolsa
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
 RUNS = ROOT / "outputs" / "runs"
 PROCESSED = ROOT / "data" / "processed"
 

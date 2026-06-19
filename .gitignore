@@ -14,6 +14,9 @@ outputs/forecasts/*
 outputs/reports/*
 outputs/runs/*
 !**/.gitkeep
+# Excepciones para Streamlit Community Cloud (los modelos los necesitan al arrancar)
+!data/processed/*.parquet
+!outputs/runs/**
 
 # Carpetas de datos fuente OneDrive / externas
 "Estimaci\303\263n precio de Bolsa*"
