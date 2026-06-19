@@ -19,6 +19,24 @@ $pyexe = "C:\Users\Lenovo\AppData\Local\Python\bin\python.exe"
 # Abrir http://localhost:8501
 ```
 
+### Dependencias del Python del sistema (el del dashboard)
+
+El dashboard se ajusta los modelos en vivo, así que el Python del **sistema** necesita TODO
+el stack: `streamlit`, `plotly`, `openpyxl`, `pandas`, `numpy`, `statsmodels`, `lightgbm`,
+`pandera`. Si al abrir un tab aparece `ModuleNotFoundError: No module named 'statsmodels'`
+(o `lightgbm`/`pandera`), instálalos en ese intérprete:
+
+```powershell
+& "C:\Users\Lenovo\AppData\Local\Python\bin\python.exe" -m pip install statsmodels pandera lightgbm
+```
+
+> ⚠️ **NO uses `-r requirements.txt` en el Python del sistema.** Ese intérprete es 3.14 y
+> `requirements.txt` fija `pandas==2.2.3` / `numpy==2.1.3`, versiones **sin wheels para 3.14**
+> → el install falla al compilar y aborta toda la transacción (statsmodels nunca se instala).
+> Instala los paquetes **sin pins**: pip resuelve `statsmodels-0.14.6` (con wheel cp314) sobre
+> el pandas/numpy ya presentes. Los pins de `requirements.txt` son para Streamlit Cloud, que
+> debe correr en **Python 3.12 o 3.13** (ahí sí hay wheels para esas versiones).
+
 ## Estructura del proyecto
 
 ```
