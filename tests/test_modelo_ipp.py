@@ -166,6 +166,45 @@ class TestVECMDriversIPP:
             assert len(fc) == 6
             assert (fc["pred"] > 0).all()
 
+    def test_vecm_condicional_con_path_incondicional_es_identico(self):
+        """Pasar el path incondicional de brent_cop produce IPP idéntico al incondicional."""
+        df = _df_ipp_sintetico(60)
+        m = VECMDriversIPP()
+        m.fit(df)
+        if not m._available:
+            pytest.skip("VECM no disponible")
+        fc_incond = m.forecast(12)
+        fc_full = m._model.predict(12)           # (12, 2) en log-espacio
+        bc_path_incond = np.exp(fc_full[:, 1])   # path incondicional en nivel
+        fc_cond = m.forecast(12, brent_cop_future=bc_path_incond)
+        assert fc_cond is not None
+        assert len(fc_cond) == 12
+        np.testing.assert_allclose(fc_cond["pred"].values, fc_incond["pred"].values, rtol=1e-6)
+
+    def test_vecm_condicional_brent_cop_afecta_ipp(self):
+        """Paths de brent_cop distintos producen pronósticos de IPP distintos."""
+        df = _df_ipp_sintetico(60)
+        m = VECMDriversIPP()
+        m.fit(df)
+        if not m._available:
+            pytest.skip("VECM no disponible")
+        last_bc = float(df["brent_cop"].dropna().iloc[-1])
+        fc_bajo = m.forecast(12, brent_cop_future=np.full(12, last_bc * 0.5))
+        fc_alto = m.forecast(12, brent_cop_future=np.full(12, last_bc * 2.0))
+        assert not np.allclose(fc_bajo["pred"].values, fc_alto["pred"].values, rtol=1e-3)
+
+    def test_ensemble_spread_material_con_escenarios_extremos(self):
+        """Con VECM condicional, el spread absoluto del ensemble alto vs bajo a 24m es >5 pts."""
+        df = _df_ipp_sintetico(60)
+        p = PronosticadorIPP()
+        p.fit(df)
+        fut_alto = p.construir_futuro_drivers(24, trm_var_anual=0.20, brent_var_anual=0.20)
+        fut_bajo = p.construir_futuro_drivers(24, trm_var_anual=-0.20, brent_var_anual=-0.20)
+        fc_alto = p.pronosticar(24, df_futuro=fut_alto)
+        fc_bajo = p.pronosticar(24, df_futuro=fut_bajo)
+        spread_abs = abs(float(fc_alto["pred"].iloc[-1] - fc_bajo["pred"].iloc[-1]))
+        assert spread_abs > 5.0
+
 
 # ---------------------------------------------------------------------------
 # Tests LGB IPP

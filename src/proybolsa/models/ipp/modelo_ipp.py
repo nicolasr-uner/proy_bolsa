@@ -258,25 +258,63 @@ class VECMDriversIPP:
         logger.debug("VECM IPP ajustado. Rango cointegración=%d", n_coint)
         return self
 
-    def forecast(self, horizon: int) -> pd.DataFrame | None:
+    def forecast(self, horizon: int, brent_cop_future=None) -> pd.DataFrame | None:
         if not self._available or self._model is None:
             return None
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            fc = self._model.predict(steps=horizon)
+        if brent_cop_future is None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                fc = self._model.predict(steps=horizon)
+            ipp_log_pred = fc[:, 0]
+        else:
+            ipp_log_pred = self._forecast_condicional(horizon, brent_cop_future)
 
-        # fc es array (horizon, 2): columnas = [ipp_log, brent_cop_log]
-        ipp_log_pred = fc[:, 0]
         pred = np.exp(ipp_log_pred)
-
-        # CI aproximado: std residuos * 1.645 (90%)
         resid_std = float(np.std(self._model.resid[:, 0]))
         horizon_std = resid_std * np.sqrt(np.arange(1, horizon + 1))
         ci_lo = np.exp(ipp_log_pred - 1.645 * horizon_std)
         ci_hi = np.exp(ipp_log_pred + 1.645 * horizon_std)
-
         return pd.DataFrame({"pred": pred, "ci_lo90": ci_lo, "ci_hi90": ci_hi})
+
+    def _forecast_condicional(self, horizon: int, brent_cop_future) -> np.ndarray:
+        """Itera la representacion VAR del VECM imponiendo el path de brent_cop.
+
+        Usa var_rep (el mismo que usa predict() internamente) para garantizar
+        coherencia numérica exacta con el forecast incondicional. En cada paso,
+        tras computar y_new con la dinámica VAR completa, sobreescribe el
+        componente de brent_cop antes de actualizar el estado.
+        """
+        brent_cop_log = np.log(np.asarray(brent_cop_future, dtype=float)[:horizon])
+
+        var_rep = self._model.var_rep        # (k_ar, k, k): coefs VAR por lag
+        k_ar = self._model.k_ar             # lags en representación VAR = k_ar_diff + 1
+
+        # Término de tendencia constante (contribución del "ci" a cada paso)
+        trend = np.zeros(var_rep.shape[1], dtype=float)
+        if "ci" in self._model.deterministic:
+            trend = self._model.alpha.dot(self._model.const_coint.T).T[0]
+
+        # Ventana de k_ar observaciones más recientes (shape: k_ar × k)
+        last_obs = self._model.y_all.T[-k_ar:].copy().astype(float)
+
+        ipp_log_pred = np.zeros(horizon)
+
+        for t in range(horizon):
+            # y_new = sum(var_rep[lag] @ y_{t-lag-1}) + trend
+            y_new = trend.copy()
+            for lag in range(k_ar):
+                y_new = y_new + var_rep[lag] @ last_obs[-(lag + 1)]
+
+            # Imponer el path de brent_cop del escenario (índice 1)
+            y_new[1] = brent_cop_log[t]
+
+            ipp_log_pred[t] = y_new[0]
+
+            # Deslizar la ventana: descartar la más antigua, añadir y_new
+            last_obs = np.vstack([last_obs[1:], y_new])
+
+        return ipp_log_pred
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +465,12 @@ class EnsembleIPP:
         """Pronostica `horizon` meses hacia adelante."""
         fc_sarima  = self.sarima.forecast(horizon)
         fc_sarimax = self.sarimax.forecast(horizon, exog_future=exog_future)
-        fc_vecm    = self.vecm.forecast(horizon)
+        brent_cop_path = (
+            exog_future["brent_cop"].iloc[:horizon].values
+            if exog_future is not None and "brent_cop" in exog_future.columns
+            else None
+        )
+        fc_vecm    = self.vecm.forecast(horizon, brent_cop_future=brent_cop_path)
         pred_lgb   = self.lgb.predict(exog_future.iloc[:horizon]) if exog_future is not None and len(exog_future) >= horizon else fc_sarima["pred"].values
 
         pred = (
