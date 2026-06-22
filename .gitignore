@@ -14,9 +14,6 @@ outputs/forecasts/*
 outputs/reports/*
 outputs/runs/*
 !**/.gitkeep
-# Excepciones para Streamlit Community Cloud (los modelos los necesitan al arrancar)
-!data/processed/*.parquet
-!outputs/runs/**
 
 # Carpetas de datos fuente OneDrive / externas
 "Estimaci\303\263n precio de Bolsa*"
@@ -36,3 +33,10 @@ mlruns/
 .env
 *.log
 dashboard/auth.yaml
+
+# Excepciones para Streamlit Community Cloud (van AL FINAL: en .gitignore gana el último
+# patrón, así que estas vencen al `*.parquet` de arriba). Sin esto, los parquets de features
+# y los outputs de la corrida mensual quedarían fuera del repo y la app no podría ajustar
+# los modelos en la nube.
+!data/processed/*.parquet
+!outputs/runs/**

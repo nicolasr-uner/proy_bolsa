@@ -1,0 +1,17 @@
+{
+  "w_sarimax": 0.044,
+  "w_lgb": 0.956,
+  "n_train": 1261,
+  "perfil_celdas": 864,
+  "aic_sarimax": -860.5,
+  "top_features_lgb": {
+    "precio_bolsa_mean_lag1d": 4867.2855602836935,
+    "precio_bolsa_mean_lag7d": 510.09117667831015,
+    "aportes_pct_lag1d": 315.5724622469861,
+    "aportes_pct_lag7d": 232.86059053556528,
+    "precio_bolsa_mean_roll7d_std": 154.426272243727
+  },
+  "errores_ciclo_anterior": [],
+  "sesgo_aplicado": {},
+  "fecha_run": "20260617"
+}
