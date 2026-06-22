@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import pickle
 import sys
 import warnings
 from pathlib import Path
@@ -31,6 +32,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 RUNS = ROOT / "outputs" / "runs"
 PROCESSED = ROOT / "data" / "processed"
+MODELS = ROOT / "outputs" / "models"
 
 st.set_page_config(
     page_title="Proyecciones Energía Colombia",
@@ -112,7 +114,16 @@ def _color_escenario(esc: str) -> str:
 
 @st.cache_resource
 def _modelo_bolsa():
-    """Ajusta PronosticadorBolsa desde los parquets de features."""
+    """Carga PronosticadorBolsa serializado (rápido) o lo ajusta en vivo (fallback).
+
+    En Cloud el `.fit()` de SARIMAX bloquea el CPU del tier gratuito; por eso se
+    prefiere el .pkl pre-ajustado (ver scripts/serializar_modelos.py). Si no existe
+    (desarrollo local sin .pkl), se ajusta en vivo.
+    """
+    pkl = MODELS / "bolsa.pkl"
+    if pkl.exists():
+        with open(pkl, "rb") as f:
+            return pickle.load(f)
     p_feat = PROCESSED / "bolsa_features_diario.parquet"
     if not p_feat.exists():
         return None
@@ -125,7 +136,16 @@ def _modelo_bolsa():
 
 @st.cache_resource
 def _modelo_ipp():
-    """Ajusta PronosticadorIPP desde los parquets de features."""
+    """Carga PronosticadorIPP serializado (rápido) o lo ajusta en vivo (fallback).
+
+    El `.fit()` del IPP (SARIMAX + Johansen/VECM) es lo que bloquea el tier gratuito
+    de Streamlit Cloud; se prefiere el .pkl pre-ajustado. El `.pronosticar()` de los
+    escenarios es barato y sigue corriendo en vivo.
+    """
+    pkl = MODELS / "ipp.pkl"
+    if pkl.exists():
+        with open(pkl, "rb") as f:
+            return pickle.load(f)
     p_feat = PROCESSED / "ipp_features_mensual.parquet"
     if not p_feat.exists():
         return None
