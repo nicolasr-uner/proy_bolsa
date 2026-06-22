@@ -121,6 +121,26 @@ Abrir http://localhost:8501 y confirmar:
 - Tab "IPP y Escenarios": sliders TRM%/Brent% → alto > base > bajo
 - Tab "Seguimiento de Precisión": errores del ciclo anterior registrados
 
+### 3b. Actualizar el dashboard en la nube (Streamlit Community Cloud)
+
+La app pública vive en **https://nicolasr-uner-proy-bolsa-dashboardapp-jep2eg.streamlit.app/**
+(repo público [nicolasr-uner/proy_bolsa](https://github.com/nicolasr-uner/proy_bolsa), Python 3.12).
+
+> ⚠️ Cloud **no ajusta los modelos en vivo** (el `.fit` de SARIMAX bloquea el CPU del tier
+> gratuito → 503). En su lugar carga `outputs/models/{bolsa,ipp}.pkl` pre-ajustados. Tras
+> cada ciclo mensual los parquets cambian, así que hay que **re-serializar y commitear** o la
+> nube queda con pronósticos viejos:
+
+```powershell
+.venv\Scripts\python scripts/serializar_modelos.py   # regenera los .pkl (desde el .venv 3.12)
+git add data/processed/*.parquet outputs/runs/ outputs/models/*.pkl
+git commit -m "ciclo {YYYY-MM}: features + modelos serializados"
+git push origin main                                  # Streamlit Cloud redespliega solo
+```
+
+(En local el dashboard cae a ajuste en vivo si no encuentra los `.pkl`, así que el paso 3 de
+arriba funciona aunque no se hayan regenerado.)
+
 ### 4. Alertas a considerar
 
 El loop mensual NO emite alertas automáticas (se diseñó para ser explícito). Revisar manualmente en `outputs/runs/{YYYY-MM}/resumen_bolsa.json`:
