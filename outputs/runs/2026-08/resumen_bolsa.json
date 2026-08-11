@@ -1,0 +1,39 @@
+{
+  "w_sarimax": 0.02,
+  "w_lgb": 0.98,
+  "n_train": 1316,
+  "perfil_celdas": 864,
+  "aic_sarimax": -929.8,
+  "top_features_lgb": {
+    "precio_bolsa_mean_lag1d": 5099.588830582856,
+    "precio_bolsa_mean_lag7d": 540.738085318997,
+    "aportes_pct_lag1d": 360.31473757128697,
+    "aportes_pct_lag7d": 228.51282660651486,
+    "precio_bolsa_mean_roll30d_std": 153.55255897674942
+  },
+  "errores_ciclo_anterior": [
+    {
+      "n_obs": 7,
+      "mae": 71.98681506649488,
+      "rmse": 87.33409578471294,
+      "sesgo": 71.98681506649488,
+      "mape_pct": 17.491584323260504,
+      "horizonte": 7,
+      "nombre_fc": "corto_diario"
+    },
+    {
+      "n_obs": 90,
+      "mae": 172.49619933853214,
+      "rmse": 200.21183889890716,
+      "sesgo": -116.7477029291077,
+      "mape_pct": 25.585285775459603,
+      "horizonte": 30,
+      "nombre_fc": "tactico"
+    }
+  ],
+  "sesgo_aplicado": {
+    "7": 71.98681506649488,
+    "30": -116.7477029291077
+  },
+  "fecha_run": "20260811"
+}

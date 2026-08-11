@@ -1,0 +1,15 @@
+{
+  "url": "https://www.dane.gov.co/files/operaciones/IPP/anex-IPP-historicos-jul2026.xlsx",
+  "periodo": "jul2026",
+  "anio": 2026,
+  "mes": 7,
+  "last_modified": "Thu, 06 Aug 2026 19:03:11 GMT",
+  "content_length": 65449,
+  "sha256": "f1e6f273036bfd3540f22f8d1890bbf724549715aadda55dc8e0c2e9909a8f76",
+  "fecha_descarga": "2026-08-11T23:29:27+00:00",
+  "serie": "oferta_interna",
+  "n_meses": 326,
+  "ultimo_mes": "2026-07-01",
+  "n_nuevas": 2,
+  "n_revisadas": 1
+}

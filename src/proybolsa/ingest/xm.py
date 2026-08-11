@@ -10,8 +10,11 @@ Limite de la API: 31 dias por consulta en metricas horarias/diarias, por eso
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Iterator, Literal
 
 import pandas as pd
@@ -20,12 +23,70 @@ logger = logging.getLogger(__name__)
 
 MAX_DIAS_POR_CONSULTA = 31
 
+# Techo por request a XM. pydataxm abre su `aiohttp.ClientSession()` SIN timeout, así que sin
+# esto un XM que acepta la conexión y se queda callado cuelga el ciclo indefinidamente.
+TIMEOUT_XM_SEG = 120
 
+
+class IngestaFallida(RuntimeError):
+    """Todos los intentos de descargar una métrica fallaron."""
+
+
+@lru_cache(maxsize=1)
 def _get_api():
-    """Crea un cliente de la API de XM (import perezoso para no exigir red en tests)."""
+    """Cliente de la API de XM, cacheado.
+
+    El `ReadDB()` de pydataxm descarga el catálogo completo de 193 métricas en su `__init__`.
+    Antes se instanciaba uno por chunk, así que una corrida completa (7 métricas × ~36 chunks)
+    bajaba el catálogo unas 250 veces. Con el caché se baja una sola vez por proceso.
+
+    Import perezoso a propósito: importar este módulo no debe exigir red.
+    """
     from pydataxm.pydataxm import ReadDB
 
     return ReadDB()
+
+
+@contextlib.contextmanager
+def _con_timeout(total: int = TIMEOUT_XM_SEG):
+    """Parchea `aiohttp.ClientSession` dentro de pydataxm para imponerle un timeout.
+
+    pydataxm 0.3.17 hace `async with aiohttp.ClientSession() as session` sin `timeout=`, y no
+    expone ninguna forma de configurarlo. Se parchea aquí, en un único lugar y de forma
+    acotada al bloque, en vez de esparcir el problema por los siete fetchers.
+    """
+    try:
+        from pydataxm import pydataxm as _px
+    except ImportError:                                     # pragma: no cover
+        yield
+        return
+
+    aiohttp = getattr(_px, "aiohttp", None)
+    if aiohttp is None:                                     # pragma: no cover
+        yield
+        return
+
+    original = aiohttp.ClientSession
+
+    class _SesionConTimeout(original):
+        def __init__(self, *a, **kw):
+            kw.setdefault("timeout", aiohttp.ClientTimeout(total=total))
+            super().__init__(*a, **kw)
+
+    aiohttp.ClientSession = _SesionConTimeout
+    try:
+        yield
+    finally:
+        aiohttp.ClientSession = original
+
+
+@dataclass
+class ResultadoChunks:
+    """Desglose de una descarga por bloques: qué llegó, qué vino vacío y qué falló."""
+    df: pd.DataFrame
+    chunks_totales: int = 0
+    chunks_vacios: list[tuple[dt.date, dt.date]] = field(default_factory=list)
+    chunks_fallidos: list[tuple[dt.date, dt.date, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -132,25 +193,76 @@ def _chunks(start: dt.date, end: dt.date, paso: int) -> Iterator[tuple[dt.date, 
 
 def fetch_metric(metric_id: str, entity: str, start: dt.date, end: dt.date) -> pd.DataFrame:
     """Descarga una metrica de XM para un rango <= 31 dias."""
-    return _get_api().request_data(metric_id, entity, start, end)
+    with _con_timeout():
+        return _get_api().request_data(metric_id, entity, start, end)
+
+
+def fetch_metric_range_detalle(
+    metric_id: str, entity: str, start: dt.date, end: dt.date, *,
+    reintentos_chunk: int = 2,
+) -> ResultadoChunks:
+    """Descarga por bloques de 31 días, reportando qué pasó con cada bloque.
+
+    La versión anterior hacía `if parte is not None and not parte.empty: partes.append(parte)`
+    y devolvía un DataFrame vacío si todo fallaba. Es decir: un XM caído y "no hay datos
+    nuevos en este rango" eran indistinguibles, y el llamador guardaba un parquet vacío o no
+    guardaba nada, sin error. Ahora el vacío y el fallo se reportan por separado y el llamador
+    decide.
+
+    Nota: `pydataxm.request_data` ya parte internamente por mes calendario, así que el chunking
+    de 31 días es doble. Se conserva porque acota el radio de daño de un fallo y permite
+    reintentar solo el bloque afectado — no lo quites pensando que es redundante.
+    """
+    partes: list[pd.DataFrame] = []
+    res = ResultadoChunks(df=pd.DataFrame())
+    chunks = list(_chunks(start, end, MAX_DIAS_POR_CONSULTA))
+    res.chunks_totales = len(chunks)
+
+    for i, (ini, fin) in enumerate(chunks, 1):
+        logger.debug("  %s [%s] chunk %d/%d: %s — %s",
+                     metric_id, entity, i, len(chunks), ini, fin)
+        ultimo_error: Exception | None = None
+        for intento in range(1, reintentos_chunk + 2):
+            try:
+                parte = fetch_metric(metric_id, entity, ini, fin)
+                ultimo_error = None
+                break
+            except Exception as exc:
+                # pydataxm hace pd.json_normalize(load['Items']) y revienta si Items viene
+                # null, que es justo el caso de un rango sin publicar todavía.
+                ultimo_error = exc
+                logger.debug("    intento %d/%d falló: %s", intento, reintentos_chunk + 1, exc)
+        if ultimo_error is not None:
+            res.chunks_fallidos.append((ini, fin, str(ultimo_error)))
+            continue
+        if parte is None or parte.empty:
+            res.chunks_vacios.append((ini, fin))
+            continue
+        partes.append(parte)
+
+    if res.chunks_fallidos and not partes:
+        detalle = "; ".join(f"{a}->{b}: {e}" for a, b, e in res.chunks_fallidos[:3])
+        raise IngestaFallida(
+            f"{metric_id} [{entity}]: fallaron los {len(res.chunks_fallidos)} bloques. {detalle}"
+        )
+    if res.chunks_fallidos:
+        logger.warning("  %s [%s]: %d de %d bloques fallaron; se devuelve lo obtenido",
+                       metric_id, entity, len(res.chunks_fallidos), res.chunks_totales)
+    if res.chunks_vacios:
+        logger.info("  %s [%s]: %d de %d bloques sin datos (%s...)",
+                    metric_id, entity, len(res.chunks_vacios), res.chunks_totales,
+                    res.chunks_vacios[0][0])
+
+    if partes:
+        res.df = pd.concat(partes, ignore_index=True)
+    return res
 
 
 def fetch_metric_range(
     metric_id: str, entity: str, start: dt.date, end: dt.date
 ) -> pd.DataFrame:
     """Descarga una metrica para un rango arbitrario, partiendo en bloques de 31 dias."""
-    partes = []
-    chunks = list(_chunks(start, end, MAX_DIAS_POR_CONSULTA))
-    for i, (ini, fin) in enumerate(chunks, 1):
-        logger.debug(
-            "  %s [%s] chunk %d/%d: %s — %s", metric_id, entity, i, len(chunks), ini, fin
-        )
-        parte = fetch_metric(metric_id, entity, ini, fin)
-        if parte is not None and not parte.empty:
-            partes.append(parte)
-    if not partes:
-        return pd.DataFrame()
-    return pd.concat(partes, ignore_index=True)
+    return fetch_metric_range_detalle(metric_id, entity, start, end).df
 
 
 # ---------------------------------------------------------------------------

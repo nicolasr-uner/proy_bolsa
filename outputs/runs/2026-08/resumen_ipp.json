@@ -1,0 +1,9 @@
+{
+  "w_sarima": 0.085,
+  "w_sarimax": 0.181,
+  "w_vecm": 0.73,
+  "w_lgb": 0.004,
+  "vecm_disponible": true,
+  "n_train": 139,
+  "fecha_run": "20260811"
+}

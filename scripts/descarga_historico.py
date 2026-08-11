@@ -1,245 +1,173 @@
-"""Descarga y guarda el historico completo de datos para los modelos.
+"""Descarga incremental de las series crudas hacia data/raw/.
 
-Descarga >= 3 anos de datos desde las fuentes confirmadas y los guarda en Parquet
-bajo data/raw/. Se puede re-ejecutar; si el archivo ya existe no se sobreescribe
-a menos que se pase --forzar.
+QUÉ CAMBIÓ Y POR QUÉ
+--------------------
+La versión anterior tenía dos funciones que juntas hacían imposible actualizar datos:
 
-Metricas que se descargan
---------------------------
-XM (precio, hidrologia, demanda):
-  - precio_bolsa_horario   (PrecBolsNaci, horario)
-  - precio_escasez         (PrecEsca, diario)
-  - aportes_diarios        (PorcApor + AporEner)
-  - embalses_diarios       (PorcVoluUtilDiar + VoluUtilDiarEner + CapaUtilDiarEner)
-  - vertimientos           (VertEner, Embalse, suma diaria)
-  - demanda_diaria         (DemaSIN)
-  - demanda_upme_medio     (EscDemUPMEMedio, para horizonte largo)
+    _ya_existe(ruta, forzar)   ->  si el parquet existe y no hay --forzar, no hagas nada
+    _guardar_parquet(df, ruta) ->  to_parquet() del archivo completo
 
-Macro:
-  - trm_diaria             (datos.gov.co)
-  - brent_diario           (FRED DCOILBRENTEU)
-  - ppi_usa_mensual        (FRED PPIACO)
-  - oni_mensual            (NOAA CPC)
-  - ipp_mensual            (BanRep SDMX / manual) — puede fallar; ver validar_ipp.py
+O sea: o se re-bajaban 3 años enteros con `--forzar`, o no se bajaba nada. Y como
+`run_monthly_update.py` invocaba este script **sin** `--forzar`, el paso de descarga era un
+no-op que registraba "OK" mientras las series envejecían. Así quedaron congeladas desde el
+17-jun-2026: Brent 30% desviado del real, TRM 10%, y `brent_cop` —el driver principal del
+IPP— 37%.
+
+Ahora cada serie declara su ventana de revisión en `proybolsa.ingest.series` y se pide
+`(última_fecha − ventana, ayer)`. El upsert fusiona, deduplica dejando ganar al dato nuevo, y
+reporta cuántas filas son nuevas y cuántas son revisiones de valores ya publicados.
 
 Uso
 ---
     .venv/Scripts/python scripts/descarga_historico.py
-    .venv/Scripts/python scripts/descarga_historico.py --forzar
-    .venv/Scripts/python scripts/descarga_historico.py --inicio 2021-01-01
+    .venv/Scripts/python scripts/descarga_historico.py --modo completo
+    .venv/Scripts/python scripts/descarga_historico.py --series macro --resync-dias 90
+    .venv/Scripts/python scripts/descarga_historico.py --fail-si-atrasado
+
+El IPP no se descarga aquí: su adquisición no es un rango de fechas sino "el anexo publicado
+más reciente" (que trae la historia completa). Lo hace `scripts/actualizar_ipp.py`.
+
+Exit codes: 0 OK · 1 alguna serie falló · 2 hay series atrasadas y se pidió --fail-si-atrasado.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import logging
 import sys
 from pathlib import Path
 
-import pandas as pd
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
 
-# ---- setup de logging ----
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+from proybolsa.ingest.series import SerieSpec, resolver  # noqa: E402
+from proybolsa.ingest.store import (  # noqa: E402
+    ResultadoUpsert,
+    estado_series,
+    rango_a_descargar,
+    upsert_parquet,
 )
-logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).parent.parent
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                    datefmt="%H:%M:%S")
+logger = logging.getLogger("descarga")
+
 DATA_RAW = ROOT / "data" / "raw"
-DATA_XM = DATA_RAW / "xm"
-DATA_MACRO = DATA_RAW / "macro"
+ESTADO = ROOT / "outputs" / "estado_datos.json"
 
 
-def _guardar_parquet(df: pd.DataFrame, ruta: Path, nombre: str) -> None:
-    if df.empty:
-        logger.warning("  %s: DataFrame vacio, no se guarda", nombre)
-        return
-    ruta.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(ruta, index=False)
-    logger.info("  Guardado: %s (%d filas)", ruta.relative_to(ROOT), len(df))
+def descargar_serie(spec: SerieSpec, *, modo: str, resync_dias: int,
+                    hoy: dt.date) -> ResultadoUpsert | None:
+    """Descarga y fusiona una serie. Devuelve None si no había nada por hacer."""
+    rango = rango_a_descargar(spec, DATA_RAW, hoy, modo=modo, resync_dias=resync_dias)
+    if rango is None:
+        logger.info("  %s: al día, nada por pedir", spec.nombre)
+        return None
+
+    desde, hasta = rango
+    logger.info("  %s: pidiendo %s -> %s", spec.nombre, desde, hasta)
+    df = spec.fetcher()(desde, hasta, **spec.kwargs_fetcher)
+
+    if df is None or df.empty:
+        # No se traga el vacío en silencio: es la diferencia entre "no hay dato nuevo" y
+        # "la fuente respondió mal", y el llamador necesita poder distinguirlo.
+        raise RuntimeError(
+            f"{spec.nombre}: la fuente devolvió 0 filas para {desde} -> {hasta}"
+        )
+    return upsert_parquet(df, spec, DATA_RAW)
 
 
-def _ya_existe(ruta: Path, forzar: bool) -> bool:
-    if ruta.exists() and not forzar:
-        logger.info("  Existe (--forzar para re-descargar): %s", ruta.relative_to(ROOT))
-        return True
-    return False
+def main() -> int:
+    p = argparse.ArgumentParser(description="Descarga incremental de series crudas.")
+    p.add_argument("--modo", choices=["incremental", "completo"], default="incremental",
+                   help="incremental (default) re-baja solo la cola de revisión de cada serie.")
+    p.add_argument("--forzar", action="store_true",
+                   help="Alias histórico de --modo completo.")
+    p.add_argument("--resync-dias", type=int, default=0,
+                   help="Amplía la cola re-descargada, para recuperar un atraso puntual.")
+    p.add_argument("--series", default=None,
+                   help="Selección: 'xm', 'macro' o una lista 'trm_diaria,brent_diario'.")
+    p.add_argument("--solo-macro", action="store_true", help="Atajo de --series macro.")
+    p.add_argument("--solo-xm", action="store_true", help="Atajo de --series xm.")
+    p.add_argument("--fail-si-atrasado", action="store_true",
+                   help="Exit 2 si al terminar alguna serie sigue fuera de su tolerancia de "
+                        "frescura. Es lo que convierte una congelación silenciosa en un fallo.")
+    p.add_argument("--hoy", default=None, help="Fecha de referencia (YYYY-MM-DD), para pruebas.")
+    args = p.parse_args()
 
+    modo = "completo" if args.forzar else args.modo
+    seleccion = args.series
+    if args.solo_macro:
+        seleccion = "macro"
+    elif args.solo_xm:
+        seleccion = "xm"
 
-def descargar_xm(inicio: dt.date, fin: dt.date, forzar: bool) -> None:
-    logger.info("=== XM (%s — %s) ===", inicio, fin)
-    from proybolsa.ingest.xm import (
-        fetch_aportes_diarios,
-        fetch_demanda_diaria,
-        fetch_demanda_upme,
-        fetch_embalses_diarios,
-        fetch_precio_bolsa_horario,
-        fetch_precio_escasez,
-        fetch_vertimientos_diarios,
-    )
+    hoy = dt.date.fromisoformat(args.hoy) if args.hoy else dt.date.today()
 
-    tareas = [
-        (
-            DATA_XM / "precio_bolsa_horario.parquet",
-            "precio_bolsa_horario",
-            lambda: fetch_precio_bolsa_horario(inicio, fin),
-        ),
-        (
-            DATA_XM / "precio_escasez.parquet",
-            "precio_escasez",
-            lambda: fetch_precio_escasez(inicio, fin),
-        ),
-        (
-            DATA_XM / "aportes_diarios.parquet",
-            "aportes_diarios",
-            lambda: fetch_aportes_diarios(inicio, fin),
-        ),
-        (
-            DATA_XM / "embalses_diarios.parquet",
-            "embalses_diarios",
-            lambda: fetch_embalses_diarios(inicio, fin),
-        ),
-        (
-            DATA_XM / "vertimientos_diarios.parquet",
-            "vertimientos_diarios",
-            lambda: fetch_vertimientos_diarios(inicio, fin),
-        ),
-        (
-            DATA_XM / "demanda_diaria.parquet",
-            "demanda_diaria",
-            lambda: fetch_demanda_diaria(inicio, fin),
-        ),
-        (
-            DATA_XM / "demanda_upme_medio.parquet",
-            "demanda_upme_medio",
-            lambda: fetch_demanda_upme(inicio, fin, scenario="Medio"),
-        ),
-    ]
+    try:
+        specs = resolver(seleccion)
+    except KeyError as exc:
+        logger.error("%s", exc)
+        return 1
 
-    for ruta, nombre, fn in tareas:
-        if _ya_existe(ruta, forzar):
-            continue
-        logger.info("  Descargando %s ...", nombre)
+    logger.info("Descarga %s de %d series (referencia: %s)", modo, len(specs), hoy)
+
+    resultados: dict[str, ResultadoUpsert | None] = {}
+    fallidas: dict[str, str] = {}
+
+    for spec in specs:
         try:
-            df = fn()
-            _guardar_parquet(df, ruta, nombre)
-        except Exception as exc:
-            logger.error("  ERROR en %s: %s", nombre, exc)
-
-
-def descargar_macro(inicio: dt.date, fin: dt.date, forzar: bool) -> None:
-    logger.info("=== Macro (%s — %s) ===", inicio, fin)
-    from proybolsa.ingest.macros import (
-        fetch_brent,
-        fetch_ipp,
-        fetch_oni,
-        fetch_ppi_usa,
-        fetch_trm,
-    )
-
-    tareas: list[tuple] = [
-        (DATA_MACRO / "trm_diaria.parquet", "trm_diaria", lambda: fetch_trm(inicio, fin)),
-        (DATA_MACRO / "brent_diario.parquet", "brent_diario", lambda: fetch_brent(inicio, fin)),
-        (
-            DATA_MACRO / "ppi_usa_mensual.parquet",
-            "ppi_usa_mensual",
-            lambda: fetch_ppi_usa(inicio, fin),
-        ),
-        (DATA_MACRO / "oni_mensual.parquet", "oni_mensual", lambda: fetch_oni(inicio, fin)),
-    ]
-
-    for ruta, nombre, fn in tareas:
-        if _ya_existe(ruta, forzar):
-            continue
-        logger.info("  Descargando %s ...", nombre)
-        try:
-            df = fn()
-            _guardar_parquet(df, ruta, nombre)
-        except Exception as exc:
-            logger.error("  ERROR en %s: %s", nombre, exc)
-
-    # IPP: puede fallar; registrar instrucciones si falla
-    ruta_ipp = DATA_MACRO / "ipp_mensual.parquet"
-    if not _ya_existe(ruta_ipp, forzar):
-        logger.info("  Descargando ipp_mensual ...")
-        try:
-            df_ipp = fetch_ipp(inicio, fin)
-            _guardar_parquet(df_ipp, ruta_ipp, "ipp_mensual")
-        except RuntimeError as exc:
-            logger.warning(
-                "  ipp_mensual no disponible automaticamente.\n"
-                "  Ejecuta scripts/validar_ipp.py para encontrar el endpoint,\n"
-                "  o carga manualmente y guarda en: %s\n"
-                "  Detalle: %s",
-                ruta_ipp,
-                exc,
+            resultados[spec.nombre] = descargar_serie(
+                spec, modo=modo, resync_dias=args.resync_dias, hoy=hoy
             )
+        except Exception as exc:
+            # Una fuente caída no debe abortar las otras 10: se registra y se sigue, y el
+            # exit code al final refleja que hubo fallos.
+            logger.error("  %s: FALLO -> %s", spec.nombre, exc)
+            fallidas[spec.nombre] = str(exc)
 
-
-def resumen(inicio: dt.date, fin: dt.date) -> None:
-    logger.info("=== Resumen de archivos descargados ===")
-    total = 0
-    for f in sorted((DATA_XM.glob("*.parquet"), DATA_MACRO.glob("*.parquet")), key=str):
-        pass
-    for directorio, label in [(DATA_XM, "XM"), (DATA_MACRO, "Macro")]:
-        archivos = sorted(directorio.glob("*.parquet"))
-        if not archivos:
-            logger.info("  [%s] (vacio)", label)
+    # --- Resumen ---
+    logger.info("=== Resumen ===")
+    nuevas_tot = revisadas_tot = 0
+    for nombre, res in resultados.items():
+        if res is None:
             continue
-        for f in archivos:
-            df = pd.read_parquet(f)
-            logger.info("  [%s] %s: %d filas", label, f.name, len(df))
-            total += len(df)
-    logger.info("  Total filas: %d", total)
+        nuevas_tot += res.filas_nuevas
+        revisadas_tot += res.filas_revisadas
+        if res.filas_revisadas:
+            logger.warning("  %s: %d valores ya publicados cambiaron de valor",
+                           nombre, res.filas_revisadas)
+    logger.info("  %d filas nuevas, %d revisadas, %d series con fallo",
+                nuevas_tot, revisadas_tot, len(fallidas))
 
+    # --- Estado de frescura ---
+    estado = estado_series(DATA_RAW, hoy)
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    ESTADO.write_text(json.dumps({
+        "generado": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "referencia": hoy.isoformat(),
+        "modo": modo,
+        "series": estado.to_dict(orient="records"),
+        "fallidas": fallidas,
+    }, indent=2, default=str), encoding="utf-8")
+    logger.info("  Estado escrito en %s", ESTADO.relative_to(ROOT))
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Descarga historico de datos para modelos.")
-    parser.add_argument(
-        "--inicio",
-        default=str((dt.date.today() - dt.timedelta(days=3 * 365)),),
-        help="Fecha de inicio (YYYY-MM-DD). Default: hace 3 anos.",
-    )
-    parser.add_argument(
-        "--fin",
-        default=str(dt.date.today() - dt.timedelta(days=1)),
-        help="Fecha de fin (YYYY-MM-DD). Default: ayer.",
-    )
-    parser.add_argument(
-        "--forzar",
-        action="store_true",
-        help="Re-descargar aunque el archivo ya exista.",
-    )
-    parser.add_argument(
-        "--solo-macro",
-        action="store_true",
-        help="Descargar solo variables macro (no XM).",
-    )
-    parser.add_argument(
-        "--solo-xm",
-        action="store_true",
-        help="Descargar solo metricas XM (no macro).",
-    )
-    args = parser.parse_args()
+    atrasadas = estado[~estado["frescura_ok"]]
+    if not atrasadas.empty:
+        for _, r in atrasadas.iterrows():
+            logger.warning("  ATRASADA %s: ultimo=%s (%s dias, tolerancia %s)",
+                           r["serie"], r["ultima_fecha"], r["dias_atraso"], r["tolerancia_dias"])
 
-    inicio = dt.date.fromisoformat(args.inicio)
-    fin = dt.date.fromisoformat(args.fin)
-
-    logger.info("Descarga historica: %s — %s", inicio, fin)
-    logger.info("Directorio datos: %s", DATA_RAW)
-
-    if not args.solo_macro:
-        descargar_xm(inicio, fin, args.forzar)
-
-    if not args.solo_xm:
-        descargar_macro(inicio, fin, args.forzar)
-
-    resumen(inicio, fin)
+    if fallidas:
+        return 1
+    if args.fail_si_atrasado and not atrasadas.empty:
+        logger.error("%d series fuera de tolerancia de frescura.", len(atrasadas))
+        return 2
     logger.info("Listo.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

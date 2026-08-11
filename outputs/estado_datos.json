@@ -1,0 +1,107 @@
+{
+  "generado": "2026-08-11T23:43:45+00:00",
+  "referencia": "2026-08-11",
+  "modo": "incremental",
+  "series": [
+    {
+      "serie": "precio_bolsa_horario",
+      "ruta": "xm/precio_bolsa_horario.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-08",
+      "dias_atraso": 3,
+      "tolerancia_dias": 5,
+      "frescura_ok": true
+    },
+    {
+      "serie": "precio_escasez",
+      "ruta": "xm/precio_escasez.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-08",
+      "dias_atraso": 3,
+      "tolerancia_dias": 40,
+      "frescura_ok": true
+    },
+    {
+      "serie": "aportes_diarios",
+      "ruta": "xm/aportes_diarios.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-10",
+      "dias_atraso": 1,
+      "tolerancia_dias": 5,
+      "frescura_ok": true
+    },
+    {
+      "serie": "embalses_diarios",
+      "ruta": "xm/embalses_diarios.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-10",
+      "dias_atraso": 1,
+      "tolerancia_dias": 5,
+      "frescura_ok": true
+    },
+    {
+      "serie": "vertimientos_diarios",
+      "ruta": "xm/vertimientos_diarios.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-10",
+      "dias_atraso": 1,
+      "tolerancia_dias": 8,
+      "frescura_ok": true
+    },
+    {
+      "serie": "demanda_diaria",
+      "ruta": "xm/demanda_diaria.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-10",
+      "dias_atraso": 1,
+      "tolerancia_dias": 5,
+      "frescura_ok": true
+    },
+    {
+      "serie": "demanda_upme_medio",
+      "ruta": "xm/demanda_upme_medio.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-01",
+      "dias_atraso": 10,
+      "tolerancia_dias": 400,
+      "frescura_ok": true
+    },
+    {
+      "serie": "trm_diaria",
+      "ruta": "macro/trm_diaria.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-07",
+      "dias_atraso": 4,
+      "tolerancia_dias": 5,
+      "frescura_ok": true
+    },
+    {
+      "serie": "brent_diario",
+      "ruta": "macro/brent_diario.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-08-03",
+      "dias_atraso": 8,
+      "tolerancia_dias": 8,
+      "frescura_ok": true
+    },
+    {
+      "serie": "ppi_usa_mensual",
+      "ruta": "macro/ppi_usa_mensual.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-06-01",
+      "dias_atraso": 71,
+      "tolerancia_dias": 100,
+      "frescura_ok": true
+    },
+    {
+      "serie": "oni_mensual",
+      "ruta": "macro/oni_mensual.parquet",
+      "existe": true,
+      "ultima_fecha": "2026-06-01",
+      "dias_atraso": 71,
+      "tolerancia_dias": 95,
+      "frescura_ok": true
+    }
+  ],
+  "fallidas": {}
+}

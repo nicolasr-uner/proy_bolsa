@@ -269,6 +269,13 @@ def main() -> None:
     parser.add_argument("--solo-ipp", action="store_true")
     parser.add_argument("--fecha-corte", default=None, help="YYYY-MM-DD (para simulacion historica)")
     parser.add_argument("--sin-descarga", action="store_true", help="Saltar descarga de datos nuevos")
+    parser.add_argument(
+        "--permitir-datos-viejos", action="store_true",
+        help="No abortar si la descarga falla o deja series fuera de tolerancia de frescura. "
+             "Necesario para la simulacion historica con --fecha-corte.",
+    )
+    parser.add_argument("--resync-dias", type=int, default=90,
+                        help="Cola extra a re-descargar (default 90, para recuperar atrasos).")
     args = parser.parse_args()
 
     periodo = pd.Timestamp.today().strftime("%Y-%m")
@@ -276,10 +283,34 @@ def main() -> None:
     logger.info("Ciclo mensual: %s -> %s", periodo, run_dir)
 
     # Paso 1: descargar datos nuevos
+    #
+    # Este paso era un no-op. Se invocaba `descarga_historico.py` SIN `--forzar`, y su
+    # `_ya_existe()` hacía skip binario cuando el parquet existía. Como los 12 parquets
+    # existían, no se descargaba nada y el paso registraba "OK": así los datos quedaron
+    # congelados dos meses mientras el ciclo se declaraba exitoso cada vez.
+    #
+    # Ahora la descarga es incremental (con la cola de revisión de cada serie) y un fallo
+    # o un atraso ABORTA el ciclo, en vez de degradarse a un warning. Pronosticar sobre
+    # datos rancios es peor que no pronosticar: el resultado parece válido.
     if not args.sin_descarga:
-        ok = _run([_PYTHON, "scripts/descarga_historico.py"], "Descargando datos nuevos")
-        if not ok:
-            logger.warning("Descarga fallo; continuando con datos existentes.")
+        cmd = [_PYTHON, "scripts/descarga_historico.py",
+               "--modo", "incremental", "--resync-dias", str(args.resync_dias)]
+        if not args.permitir_datos_viejos:
+            cmd.append("--fail-si-atrasado")
+        ok = _run(cmd, "Descargando datos nuevos")
+        if not ok and not args.permitir_datos_viejos:
+            logger.error(
+                "La descarga falló o dejó series atrasadas. Se aborta el ciclo: un pronóstico "
+                "sobre datos viejos es indistinguible de uno bueno. "
+                "Use --permitir-datos-viejos si es intencional."
+            )
+            return
+
+        ok_ipp = _run([_PYTHON, "scripts/actualizar_ipp.py"], "Actualizando IPP (anexo DANE)")
+        if not ok_ipp:
+            # No aborta: el IPP tiene su propio ciclo de publicación y el modelo de bolsa no
+            # depende de él. Pero tiene que verse.
+            logger.warning("No se pudo actualizar el IPP; se sigue con la serie vigente.")
 
     # Paso 2: reconstruir feature matrices
     ok = _run([_PYTHON, "scripts/construir_features.py"], "Construyendo feature matrices")
