@@ -20,6 +20,7 @@ import argparse
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from proybolsa.features.calendar import agregar_features_calendario, agregar_features_fecha
@@ -225,8 +226,11 @@ def construir_features_ipp() -> None:
 
     # Agregar mes (cyclical encoding)
     macro["mes"] = pd.to_datetime(macro["fecha"]).dt.month
-    macro["cos_mes"] = macro["mes"].apply(lambda m: __import__("math").cos(2 * 3.14159 * m / 12))
-    macro["sin_mes"] = macro["mes"].apply(lambda m: __import__("math").sin(2 * 3.14159 * m / 12))
+    # np.pi (no el literal 3.14159): modelo_ipp.construir_futuro_drivers usa np.pi para el
+    # lado FUTURO, y dos constantes distintas hacen que histórico y futuro no sean la misma
+    # parametrización de estacionalidad.
+    macro["cos_mes"] = np.cos(2 * np.pi * macro["mes"] / 12)
+    macro["sin_mes"] = np.sin(2 * np.pi * macro["mes"] / 12)
 
     # Lags de drivers originales (mantenidos para compatibilidad con datos hist.)
     for col in ("trm", "brent", "ppi_usa"):
@@ -258,10 +262,19 @@ def construir_features_ipp() -> None:
     if df_ipp is not None:
         df_ipp["fecha"] = pd.to_datetime(df_ipp["fecha"])
         macro["fecha"] = pd.to_datetime(macro["fecha"])
-        macro = macro.merge(df_ipp, on="fecha", how="left")
+        # how="outer" (no "left"): con "left" la muestra queda recortada al rango de los
+        # macros (que arrancan en 2015-01), tirando toda la historia previa del IPP. Que
+        # cada modelo decida su muestra útil, no el pipeline de features.
+        macro = macro.merge(df_ipp, on="fecha", how="outer")
+        macro = macro.sort_values("fecha").reset_index(drop=True)
         macro = agregar_lags_mensuales(macro, "ipp", lags_meses=[1, 2, 3, 12], col_fecha="fecha")
         # Variacion mensual log
-        macro["ipp_log_dif"] = macro["ipp"].apply(__import__("numpy").log).diff()
+        macro["ipp_log_dif"] = np.log(macro["ipp"]).diff()
+        # Marca de exógenas completas: las YoY nacen NaN sus primeros 12-13 meses, y los
+        # modelos no deben imputarlas con 0. Esto permite recortar la muestra en vez de
+        # inventar datos.
+        cols_exog = [c for c in ("brent_yoy_lag1m", "trm_yoy_lag1m", "brent_cop") if c in macro.columns]
+        macro["exog_completa"] = macro[cols_exog].notna().all(axis=1) if cols_exog else False
 
     _guardar(macro, "ipp_features_mensual.parquet")
 

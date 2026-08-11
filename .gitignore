@@ -40,3 +40,35 @@ dashboard/auth.yaml
 # los modelos en la nube.
 !data/processed/*.parquet
 !outputs/runs/**
+
+# Sin lectores: lo escribe construir_features.py y no lo consume nadie (ni dashboard, ni
+# modelos, ni tests). 713 KB de blob binario en cada commit, a cambio de nada.
+/data/processed/bolsa_features_horario.parquet
+
+# data/raw: los datos crudos se versionan para que la ingesta incremental de CI tenga a qué
+# hacer append (un runner arranca sin ellos) y como rastro de auditoría. Son ~570 KB.
+# OJO: `data/raw/*` de arriba excluye los DIRECTORIOS `xm/` y `macro/`, y git no desciende
+# en un directorio excluido — por eso hay que negar los directorios ANTES de sus contenidos.
+!/data/raw/xm/
+!/data/raw/macro/
+/data/raw/xm/*
+/data/raw/macro/*
+!/data/raw/xm/*.parquet
+!/data/raw/macro/*.parquet
+!/data/raw/macro/ipp_manual.csv
+!/data/raw/macro/ipp_manual_PLANTILLA.csv
+!/data/raw/macro/ipp_anexo_meta.json
+!/data/raw/macro/ipp_revisiones.csv
+# Los .xlsx descargados del DANE no se versionan: son insumo, no dato.
+/data/raw/macro/anexos/
+
+# Backtest, tracking y reportes: el dashboard los consume EN LA NUBE (tab de precisión y
+# propuesta de mejora). Sin estas excepciones el tab sale vacío en Cloud y perfecto en local,
+# que es el modo de falla más difícil de diagnosticar.
+!/outputs/backtest/*.parquet
+!/outputs/reports/*.md
+!/outputs/forecast_log.parquet
+!/outputs/accuracy_log.parquet
+!/outputs/estado_datos.json
+!/outputs/sesgo_estado.json
+!/outputs/models/*.meta.json

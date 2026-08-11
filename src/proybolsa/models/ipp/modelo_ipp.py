@@ -30,6 +30,8 @@ import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.vector_ar.vecm import VECM, coint_johansen
 
+from proybolsa.models.sarimax_pickle import PickleCompactoSARIMAX
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,36 @@ _FEATS_LGB = [
 ]
 
 _VECM_VARS = ["ipp", "brent_cop"]  # sistema 2-variable: más estable con n≈137
+
+# Columnas sin las cuales los componentes con drivers (SARIMAX, VECM, LGB) no son
+# estimables. `construir_features.py` mergea el IPP con los macros en how="outer", así que
+# el parquet trae la historia completa del IPP (1999-06+) con drivers NaN antes de 2015-01.
+# Sin recortar, el SARIMAX imputaría 0 en las YoY y el LGB -9999 sobre ~200 meses: inventar
+# señal en vez de reconocer que falta.
+_DRIVERS_REQUERIDOS = ["brent_cop"]
+
+
+def recortar_a_drivers(df: pd.DataFrame, cols: list[str] | None = None) -> pd.DataFrame:
+    """Recorta el DataFrame al tramo final donde los drivers requeridos existen.
+
+    Los modelos univariados (SARIMA/ARIMA, ETS) pueden aprovechar toda la historia; los que
+    consumen drivers, no. Esta función define la muestra común del ensemble actual.
+    """
+    cols = [c for c in (cols or _DRIVERS_REQUERIDOS) if c in df.columns]
+    if not cols:
+        return df
+    mask = df[cols].notna().all(axis=1)
+    if not mask.any():
+        logger.warning("IPP: ningún mes tiene %s; no se recorta la muestra", cols)
+        return df
+    primera = df.loc[mask, "fecha"].min()
+    recortado = df[df["fecha"] >= primera].reset_index(drop=True)
+    if len(recortado) < len(df):
+        logger.info(
+            "IPP: muestra recortada a drivers disponibles (%d -> %d meses, desde %s)",
+            len(df), len(recortado), pd.to_datetime(primera).date(),
+        )
+    return recortado
 
 
 # ---------------------------------------------------------------------------
@@ -109,14 +141,24 @@ def johansen_cointegracion(df: pd.DataFrame, max_lags: int = 2) -> dict:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SARIMABaselineIPP:
+class SARIMABaselineIPP(PickleCompactoSARIMAX):
     """SARIMA univariado en diferencias log del IPP.
 
-    Estima el mejor orden (p,d,q)(P,D,Q,12) buscando entre modelos candidatos
-    y seleccionando por AIC. Trabaja en log-dif para estacionariedad.
+    Trabaja en log con d=1 (el IPP es I(1): ADF p=0.90 en log-nivel, p<0.001 en log-dif).
+
+    ATENCIÓN — sin término de drift. El orden está fijo en (1,1,1) sin `trend`, lo que hace
+    que el pronóstico converja a una recta plana: proyecta +0.4% a 12 meses contra una deriva
+    histórica de +5.1%/año. Medido: RMSE a h=24 de 50.63 contra 29.70 de un random walk, es
+    decir peor que no hacer nada. La Fase 2 del plan lo reemplaza por `ARIMADriftIPP` con
+    selección de orden por AIC e `trend="c"` entre los candidatos.
     """
     _result: object = field(default=None, init=False, repr=False)
     _ipp_init: float = field(default=100.0, init=False, repr=False)  # ultimo nivel para reconstruir
+    # Guardados para el pickle compacto (ver models/sarimax_pickle.py)
+    _endog: object = field(default=None, init=False, repr=False)
+    _exog: object = field(default=None, init=False, repr=False)
+    _order: tuple = field(default=(1, 1, 1), init=False, repr=False)
+    _seasonal_order: tuple = field(default=(0, 0, 0, 0), init=False, repr=False)
 
     def fit(self, df_train: pd.DataFrame) -> "SARIMABaselineIPP":
         ipp = df_train["ipp"].dropna()
@@ -125,9 +167,10 @@ class SARIMABaselineIPP:
         # ARIMA(1,1,1) sin componente estacional (IPP mensual tiene ciclo debil)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model = SARIMAX(log_ipp, order=(1, 1, 1), seasonal_order=(0, 0, 0, 0),
+            model = SARIMAX(log_ipp, order=self._order, seasonal_order=self._seasonal_order,
                             enforce_stationarity=False, enforce_invertibility=False)
             self._result = model.fit(disp=False)
+        self._endog, self._exog = log_ipp, None
         logger.debug("SARIMA IPP ajustado. AIC=%.1f", self._result.aic)
         return self
 
@@ -159,10 +202,27 @@ class SARIMABaselineIPP:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SARIMAXDriversIPP:
-    """SARIMAX con TRM, Brent y PPI USA rezagados como variables exógenas."""
+class SARIMAXDriversIPP(PickleCompactoSARIMAX):
+    """SARIMAX del IPP con drivers macro rezagados como variables exógenas.
+
+    Las exógenas reales son `_EXOG_SARIMAX` (YoY de Brent y TRM, dummy El Niño y los
+    términos trigonométricos del mes). `ppi_usa` NO se consume: se descartó por
+    multicolinealidad, aunque el VIF se midió en niveles (ver plan, Fase 2).
+
+    Dos limitaciones medidas, ambas atacadas en la Fase 2 del plan:
+      - Sin drift, igual que `SARIMABaselineIPP`: a h=24 el RMSE es 30.06 contra 24.43 de la
+        misma especificación con `trend="c"`.
+      - Los drivers no aportan precisión out-of-sample: incluso con foresight perfecto de las
+        exógenas no le gana a un ARIMA univariado en ningún horizonte. Su valor real es
+        articular escenarios (mover TRM/Brent y ver la respuesta), no reducir el error.
+    """
     _result: object = field(default=None, init=False, repr=False)
     _exog_cols: list = field(default_factory=list, init=False, repr=False)
+    # Guardados para el pickle compacto (ver models/sarimax_pickle.py)
+    _endog: object = field(default=None, init=False, repr=False)
+    _exog: object = field(default=None, init=False, repr=False)
+    _order: tuple = field(default=(1, 1, 1), init=False, repr=False)
+    _seasonal_order: tuple = field(default=(0, 0, 0, 0), init=False, repr=False)
 
     def fit(self, df_train: pd.DataFrame) -> "SARIMAXDriversIPP":
         df = df_train.copy()
@@ -176,9 +236,10 @@ class SARIMAXDriversIPP:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = SARIMAX(log_ipp, exog=exog,
-                            order=(1, 1, 1), seasonal_order=(0, 0, 0, 0),
+                            order=self._order, seasonal_order=self._seasonal_order,
                             enforce_stationarity=False, enforce_invertibility=False)
             self._result = model.fit(disp=False)
+        self._endog, self._exog = log_ipp, exog
         logger.debug("SARIMAX IPP ajustado. AIC=%.1f", self._result.aic)
         return self
 
@@ -424,7 +485,10 @@ class EnsembleIPP:
 
     def _normalizar_pesos(self) -> None:
         if not self.vecm._available:
-            self.w_sarima = 0.3; self.w_sarimax = 0.4; self.w_vecm = 0.0; self.w_lgb = 0.3
+            self.w_sarima = 0.3
+            self.w_sarimax = 0.4
+            self.w_vecm = 0.0
+            self.w_lgb = 0.3
         logger.info("Pesos IPP: SARIMA=%.2f SARIMAX=%.2f VECM=%.2f LGB=%.2f",
                     self.w_sarima, self.w_sarimax, self.w_vecm, self.w_lgb)
 
@@ -526,11 +590,18 @@ class PronosticadorIPP:
         self,
         df_features: pd.DataFrame,
         val_fraccion: float = 0.15,
+        muestra: Literal["drivers", "completa"] = "drivers",
     ) -> "PronosticadorIPP":
         """Ajusta el ensemble con la feature matrix mensual.
 
         Requiere que df_features tenga columna 'ipp'. Si no la tiene,
         solo ajusta los modelos univariados sobre los drivers.
+
+        Parámetros
+        ----------
+        muestra : "drivers" recorta al tramo donde los drivers macro existen (2015-01+),
+                  que es la muestra estimable por SARIMAX/VECM/LGB. "completa" usa toda la
+                  historia del IPP (1999-06+) y solo tiene sentido para modelos univariados.
         """
         if "ipp" not in df_features.columns:
             raise ValueError(
@@ -538,6 +609,8 @@ class PronosticadorIPP:
                 "Cargar datos IPP con load_ipp_local() y volver a correr construir_features.py"
             )
         df = df_features.sort_values("fecha").dropna(subset=["ipp"]).reset_index(drop=True)
+        if muestra == "drivers":
+            df = recortar_a_drivers(df)
         self._df_train = df
         self._fecha_ultimo = pd.to_datetime(df["fecha"].iloc[-1])
 

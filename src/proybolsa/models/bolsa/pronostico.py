@@ -22,7 +22,7 @@ import pandas as pd
 
 from proybolsa.features.calendar import agregar_features_fecha
 from proybolsa.features.hourly_profile import aplicar_perfil_horario, cargar_perfil
-from proybolsa.models.bolsa.nivel_diario import EnsembleNivel, LGBNivel, SARIMAXNivel
+from proybolsa.models.bolsa.nivel_diario import EnsembleNivel
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +165,7 @@ class PronosticadorBolsa:
         devolver_horario: bool = True,
         aportes_pct: float | None = None,
         volumen_util_pct: float | None = None,
+        devolver_componentes: bool = False,
     ) -> pd.DataFrame | dict[str, pd.DataFrame]:
         """Genera el pronostico para los proximos `horizonte_dias` dias.
 
@@ -179,13 +180,27 @@ class PronosticadorBolsa:
         devolver_horario    : Si True (default), expande a 24h usando perfil
         aportes_pct         : Override de hidrologia (sliders del dashboard); None usa el preset
         volumen_util_pct    : Override de volumen util; None usa el preset
+        devolver_componentes: Si True, agrega pred_sarimax y pred_lgb (la prediccion de cada
+                              componente del ensemble, sin ponderar). Incompatible con
+                              devolver_horario=True. Los componentes NO traen intervalo:
+                              SARIMAX lo calcula y el ensemble lo descarta, y LGB no produce
+                              ninguno. Solo `pred` tiene ci_lo90/ci_hi90.
 
         Returns
         -------
         DataFrame con columnas: fecha, pred_diaria, ci_lo90, ci_hi90
         Si devolver_horario=True: agrega timestamp (horario), pred_horaria
+        Si devolver_componentes=True: agrega pred_sarimax, pred_lgb
         Si escenarios_multiples=True: devuelve dict{'seco':..., 'promedio':..., 'humedo':...}
         """
+        if devolver_componentes and devolver_horario:
+            raise ValueError(
+                "devolver_componentes=True es incompatible con devolver_horario=True: las "
+                "columnas de componentes no sobreviven la expansion horaria (el merge del "
+                "perfil solo arrastra pred_diaria y las bandas). "
+                "Llame pronosticar(..., devolver_horario=False, devolver_componentes=True)."
+            )
+
         if escenarios_multiples:
             if aportes_pct is not None or volumen_util_pct is not None:
                 raise ValueError(
@@ -198,6 +213,7 @@ class PronosticadorBolsa:
                     horizonte_dias, fecha_inicio, escenario=esc,
                     precio_escasez=precio_escasez, oni_asumido=oni_asumido,
                     escenarios_multiples=False, devolver_horario=devolver_horario,
+                    devolver_componentes=devolver_componentes,
                 )
                 for esc in ("seco", "promedio", "humedo")
             }
@@ -231,6 +247,7 @@ class PronosticadorBolsa:
             df_futuro,
             horizon=horizonte_dias,
             exog_future=df_futuro,
+            devolver_componentes=devolver_componentes,
         )
         pred_df["fecha"] = [r.date() for r in pd.date_range(fecha_inicio, periods=horizonte_dias)]
         pred_df = pred_df.rename(columns={"pred": "pred_diaria"})

@@ -5,11 +5,16 @@
 #   A) Dependencias del dashboard (Streamlit + visualización)
 #   B) Dependencias de los modelos (stats + ML)
 #
-# Python >= 3.11 requerido (uv: python = ">=3.11")
+# Python 3.12 requerido: pyproject.toml exige >=3.12,<3.13, y los pins de pandas/numpy no
+# tienen wheels para 3.14. En Streamlit Community Cloud hay que fijar 3.12 explicitamente.
+#
+# Los pins deben coincidir con [project.dependencies] de pyproject.toml: lo que se prueba en
+# local tiene que ser lo que corre en la nube. Los .pkl pre-ajustados se generan con el .venv
+# y se deserializan en Cloud, asi que una divergencia de version rompe la carga del modelo.
 
 # --- A) Dashboard ---
 streamlit==1.55.0
-plotly==6.6.0
+plotly==6.8.0
 openpyxl==3.1.5
 
 # --- B) Modelos ---
@@ -18,6 +23,11 @@ numpy==2.1.3
 statsmodels==0.14.6
 lightgbm==4.6.0
 pandera==0.31.1
+# scipy: lo importa proybolsa.backtest.rolling_origin, que el tab de precision consume.
+scipy>=1.11
+# pyarrow explicito: hoy llega transitivo por streamlit. Si streamlit lo suelta, el dashboard
+# deja de poder leer parquets sin ningun aviso.
+pyarrow>=14
 
 # --- C) Ingesta (solo para run_monthly_update.py, no necesario para el dashboard) ---
 # pydataxm>=0.4

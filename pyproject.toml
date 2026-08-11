@@ -18,17 +18,18 @@ dependencies = [
   "pyarrow>=14",
   "requests>=2.31",
   "pydataxm==0.3.17",
-  "statsforecast==2.0.3",
   "statsmodels==0.14.6",
-  "mlforecast==1.0.31",
-  "utilsforecast==0.2.16",
   "lightgbm==4.6.0",
-  "scikit-learn==1.9.0",
   "pandera==0.31.1",
   "holidays>=0.46",
   "pyyaml==6.0.3",
-  "matplotlib==3.11.0",
   "plotly==6.8.0",
+  # scipy: lo importa src/proybolsa/backtest/rolling_origin.py (stats para Diebold-Mariano).
+  # Llegaba transitivo por statsmodels; declararlo evita que un dia deje de llegar.
+  "scipy>=1.11",
+  # openpyxl: lo importan scripts/parsear_ipp_dane.py y dashboard/app.py. Faltaba, asi que
+  # `pip install -e .` en un runner limpio no podia parsear el anexo del DANE.
+  "openpyxl==3.1.5",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +39,20 @@ dependencies = [
 dev = ["pytest==9.1.0", "ruff>=0.6"]
 viz = ["streamlit>=1.36"]
 track = ["mlflow>=2.14"]
+# Solo los usa scripts/check_modeling_stack.py (verificado: ningun modulo de src/ los
+# importa). Arrastran numba/llvmlite, que es la parte mas lenta y fragil del install en CI;
+# fuera del core, el workflow instala en una fraccion del tiempo.
+# numpy queda fijado en 2.1.x justamente por numba 0.65, asi que el pin sigue en el core.
+stackcheck = [
+  "statsforecast==2.0.3",
+  "mlforecast==1.0.31",
+  "utilsforecast==0.2.16",
+  "scikit-learn==1.9.0",
+]
+# Generacion de reportes descargables (Fase 5 del plan): matplotlib dibuja las figuras raster
+# que reportlab embebe en el PDF. Se prefiere matplotlib sobre kaleido porque kaleido>=1.0
+# descarga Chrome en runtime (~150 MB), inviable en el contenedor efimero de Streamlit Cloud.
+report = ["matplotlib==3.11.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

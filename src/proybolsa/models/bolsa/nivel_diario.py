@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
+from proybolsa.models.sarimax_pickle import PickleCompactoSARIMAX
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -111,7 +113,7 @@ def _exp_precio(s: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SARIMAXNivel:
+class SARIMAXNivel(PickleCompactoSARIMAX):
     """Wrapper ligero sobre statsmodels.SARIMAX para precio de bolsa diario.
 
     Trabaja en log-espacio. El pronostico se devuelve en escala original.
@@ -119,6 +121,12 @@ class SARIMAXNivel:
     order: tuple = _SARIMAX_ORDER
     seasonal_order: tuple = _SARIMAX_SEAS
     _result: object = field(default=None, init=False, repr=False)
+    _exog_cols: list = field(default_factory=list, init=False, repr=False)
+    # Guardados para el pickle compacto (ver models/sarimax_pickle.py)
+    _endog: object = field(default=None, init=False, repr=False)
+    _exog: object = field(default=None, init=False, repr=False)
+    _order: tuple = field(default=_SARIMAX_ORDER, init=False, repr=False)
+    _seasonal_order: tuple = field(default=_SARIMAX_SEAS, init=False, repr=False)
 
     def fit(self, df_train: pd.DataFrame) -> "SARIMAXNivel":
         df = _agregar_trig_mes(df_train.copy())
@@ -138,6 +146,8 @@ class SARIMAXNivel:
             warnings.simplefilter("ignore")
             self._result = model.fit(disp=False)
         self._exog_cols = exog_cols
+        self._endog, self._exog = y, exog
+        self._order, self._seasonal_order = self.order, self.seasonal_order
         logger.debug("SARIMAX ajustado. AIC=%.1f", self._result.aic)
         return self
 
@@ -357,7 +367,6 @@ class EnsembleNivel:
             pred = pred - self.sesgo_por_horizonte[n]
 
         # Ancho del CI en log-espacio desde SARIMAX, centrado en el ensemble
-        log_pred_sar = sar_df["pred_log"].values
         log_lo90 = np.log(np.maximum(sar_df["ci_lo90"].values, 1.0))
         log_hi90 = np.log(np.maximum(sar_df["ci_hi90"].values, 1.0))
         half_width = (log_hi90 - log_lo90) / 2.0
