@@ -247,10 +247,14 @@ def _fabricas() -> dict[str, Callable[[], object]]:
         "ipp_bench_drift": DriftIPP,
         "ipp_bench_drift12": lambda: DriftIPP(ventana=12),
         "ipp_bench_theta": ThetaIPP,
-        # Estado actual (línea base "antes")
+        # Componente univariado ANTERIOR, conservado como línea base "antes". `EnsembleIPP` ya
+        # no lo usa: su campo `sarima` es ahora ARIMADriftIPP.
         "ipp_sarima_actual": SARIMABaselineIPP,
         "ipp_sarimax_actual": SARIMAXDriversIPP,
-        "ipp_ensemble_actual": EnsembleIPP,
+        # OJO con el nombre: `EnsembleIPP` cambió de componentes, así que esta clave mide el
+        # ensemble VIGENTE, no el de antes. La línea base histórica quedó congelada en
+        # outputs/backtest/metricas_ipp_baseline.parquet.
+        "ipp_ensemble": EnsembleIPP,
         # Componentes sueltos del ensemble: hacen falta medidos por separado para poder
         # calibrar los pesos por horizonte sin foresight ni mezcla de horizontes.
         "ipp_vecm": VECMDriversIPP,
@@ -337,11 +341,17 @@ def backtest_ipp(
 
 
 def comparar_contra_benchmark(errores: pd.DataFrame, clave_modelo: str,
-                              clave_benchmark: str = "auto") -> pd.DataFrame:
+                              clave_benchmark: str = "auto",
+                              min_validas: int = 10) -> pd.DataFrame:
     """Diebold-Mariano del modelo contra un benchmark, por horizonte.
 
     Con `clave_benchmark='auto'` se elige, para cada horizonte, el benchmark con menor RMSE.
     Es la comparación exigente: no basta ganarle al random walk si el drift es mejor.
+
+    `min_validas` descarta los pares con muy pocas predicciones reales. Sin ese filtro, un
+    modelo que solo pudo pronosticar en 1 de 56 orígenes -el caso del VECM cuando su regla de
+    activación casi nunca se cumple- aparecía con skill 0.77 y n=56: el skill salía de esa
+    única observación y el n contaba fechas donde el modelo no había predicho nada.
     """
     from proybolsa.backtest.rolling_origin import diebold_mariano
 
@@ -349,22 +359,25 @@ def comparar_contra_benchmark(errores: pd.DataFrame, clave_modelo: str,
     filas = []
     for h in sorted(errores["horizonte"].unique()):
         eh = errores[errores["horizonte"] == h]
-        em = eh[eh["modelo"] == clave_modelo].sort_values("fecha_corte")
-        if em.empty:
+        em = eh[eh["modelo"] == clave_modelo].dropna(subset=["error"]).sort_values("fecha_corte")
+        if len(em) < min_validas:
             continue
 
         if clave_benchmark == "auto":
-            rmses = {b: np.sqrt(np.mean(eh[eh["modelo"] == b]["error"].dropna() ** 2))
-                     for b in benchmarks if not eh[eh["modelo"] == b].empty}
+            rmses = {}
+            for b in benchmarks:
+                eb_ = eh[eh["modelo"] == b]["error"].dropna()
+                if len(eb_) >= min_validas:
+                    rmses[b] = np.sqrt(np.mean(eb_ ** 2))
             if not rmses:
                 continue
             bench = min(rmses, key=rmses.get)
         else:
             bench = clave_benchmark
 
-        eb = eh[eh["modelo"] == bench].sort_values("fecha_corte")
+        eb = eh[eh["modelo"] == bench].dropna(subset=["error"]).sort_values("fecha_corte")
         comun = set(em["fecha_corte"]) & set(eb["fecha_corte"])
-        if len(comun) < 5:
+        if len(comun) < min_validas:
             continue
         em2 = em[em["fecha_corte"].isin(comun)].sort_values("fecha_corte")
         eb2 = eb[eb["fecha_corte"].isin(comun)].sort_values("fecha_corte")

@@ -111,9 +111,16 @@ def calcular_metricas(errores: pd.DataFrame, *, variable: str | None = None,
     rows = []
     for h, g in grupos:
         tiene_ci = "ci_lo90" in g.columns
+        # `n_predicciones` cuenta filas; `n_validas` cuenta las que realmente produjeron un
+        # numero. La distincion importa: un modelo que solo pudo pronosticar en 1 de 56
+        # origenes (p. ej. el VECM cuando su regla de activacion casi nunca se cumple) muestra
+        # un RMSE calculado sobre esa unica observacion, que parece excelente y no significa
+        # nada. Sin esta columna, ese numero viaja al parquet sin ninguna advertencia.
+        n_validas = int((~(g["y_real"].isna() | g["y_pred"].isna())).sum())
         fila = {
             "horizonte": h,
             "n_predicciones": len(g),
+            "n_validas": n_validas,
             "rmse": _rmse(g["y_real"].values, g["y_pred"].values),
             "mae": _mae(g["y_real"].values, g["y_pred"].values),
             "mape_pct": _mape(g["y_real"].values, g["y_pred"].values),

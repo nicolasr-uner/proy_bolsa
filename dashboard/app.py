@@ -619,7 +619,12 @@ with tab_ipp:
                     brent_var_anual=brent_var / 100,
                     oni=float(oni_i),
                 )
-                fc_i = modelo_i.pronosticar(horizonte_i, df_futuro=fut)
+                # modo="escenario": reparte el peso entre los componentes que SI responden a
+                # los drivers. El pronostico oficial (modo precision) usa pesos calibrados por
+                # backtest que dejan al VECM en el piso, y el VECM es el que aporta casi toda
+                # la sensibilidad a TRM/Brent. Sin este modo, mover los sliders +-20% cambia el
+                # resultado 1.2 puntos en vez de 14.8, y el tab no comunica nada.
+                fc_i = modelo_i.pronosticar(horizonte_i, df_futuro=fut, modo="escenario")
                 fc_i["fecha"] = pd.to_datetime(fc_i["fecha"])
             st.session_state["_ultimo_fc_ipp"] = fc_i
             st.session_state["_ultimo_params_ipp"] = {
@@ -630,6 +635,13 @@ with tab_ipp:
         fc_i_actual = st.session_state.get("_ultimo_fc_ipp")
 
         if fc_i_actual is not None:
+            st.info(
+                "**Esto es un ejercicio de sensibilidad, no el pronóstico oficial.** El "
+                "escenario reparte el peso entre los componentes que responden a TRM y Brent, "
+                "para que los sliders comuniquen una elasticidad. Por eso su nivel base "
+                "difiere del pronóstico de la gráfica de arriba, que usa los pesos calibrados "
+                "por backtest. Úselo para leer *cuánto se movería*, no *cuánto va a valer*."
+            )
             fig_i = go.Figure()
 
             # Histórico

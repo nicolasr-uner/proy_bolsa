@@ -592,6 +592,13 @@ class EnsembleIPP:
     lambda_shrink: float = 10.0
     piso_peso: float = 0.02
 
+    # Bandas calibradas empíricamente. Viaja dentro del pickle, así que Streamlit Cloud usa la
+    # calibración hecha en local sin tener que correr un backtest.
+    calibrador: object = None
+    # Claves del backtest de donde se calibra la banda, en orden de preferencia: primero el
+    # propio ensemble, y si no está, el componente dominante.
+    _CLAVES_CALIBRACION = ("ipp_ensemble", "ipp_arima_drift")
+
     _CLAVES_BACKTEST = {
         "sarima": "ipp_arima_drift",
         "sarimax": "ipp_sarimax_actual",
@@ -627,6 +634,7 @@ class EnsembleIPP:
         # de calibrar_pesos_desde_backtest), así que solo se usa si no hay backtest disponible.
         if errores_backtest is not None and not errores_backtest.empty:
             self.calibrar_pesos_desde_backtest(errores_backtest)
+            self.calibrar_intervalos_desde_backtest(errores_backtest)
         elif df_val is not None and len(df_val) >= 3:
             logger.warning(
                 "Sin backtest disponible: se calibran los pesos con el metodo antiguo "
@@ -746,6 +754,28 @@ class EnsembleIPP:
     # Componentes con un canal real hacia los drivers macro. El ARIMA es univariado: su
     # respuesta a TRM/Brent es exactamente cero por construcción.
     _COMPONENTES_CON_DRIVERS = ("sarimax", "vecm", "lgb")
+
+    def calibrar_intervalos_desde_backtest(self, errores: pd.DataFrame) -> "EnsembleIPP":
+        """Calibra las bandas con los cuantiles empíricos del error del rolling-origin.
+
+        Reemplaza el trasplante del ancho de un componente. Las bandas nominales del 90%
+        cubrían entre 44% y 75% según horizonte: no eran intervalos del 90%.
+        """
+        from proybolsa.models.ipp.incertidumbre import CalibradorIntervalos
+
+        disponibles = set(errores.get("modelo", pd.Series(dtype=str)).unique())
+        for clave in self._CLAVES_CALIBRACION:
+            if clave not in disponibles:
+                continue
+            cal = CalibradorIntervalos.desde_errores(errores, clave)
+            if cal.disponible:
+                self.calibrador = cal
+                if clave != self._CLAVES_CALIBRACION[0]:
+                    logger.info("Intervalos calibrados con %s (el ensemble no estaba en el "
+                                "backtest); las bandas seran ligeramente optimistas", clave)
+                return self
+        logger.warning("No se pudo calibrar los intervalos: se usara el ancho nominal escalado")
+        return self
 
     def pesos_escenario(self) -> dict[str, float]:
         """Pesos del modo escenario: reparto igual entre los componentes con drivers.
@@ -890,11 +920,19 @@ class EnsembleIPP:
         # nominales al 90% cubren entre 44% y 75% según el horizonte. Eso lo arregla el
         # calibrador empírico de la Fase 2.4, no este cambio.
         fc_ancho = fc_sarima if "ci_lo90" in fc_sarima.columns else fc_sarimax
-        half_log = (np.log(fc_ancho["ci_hi90"].values.clip(1)) -
-                    np.log(fc_ancho["ci_lo90"].values.clip(1))) / 2
-        log_pred = np.log(np.maximum(pred, 1))
-        ci_lo = np.exp(log_pred - half_log)
-        ci_hi = np.exp(log_pred + half_log)
+        nominal = (fc_ancho["ci_lo90"].values, fc_ancho["ci_hi90"].values)
+        pasos = np.arange(1, horizon + 1)
+
+        if self.calibrador is not None:
+            # Banda de los cuantiles empíricos del error medido, no del intervalo teórico de
+            # un componente. Si el calibrador no tiene datos suficientes, degrada solo al
+            # ancho nominal ESCALADO por el factor de subcobertura medido.
+            ci_lo, ci_hi = self.calibrador.aplicar(pred, pasos, ci_nominal=nominal)
+        else:
+            half_log = (np.log(nominal[1].clip(1)) - np.log(nominal[0].clip(1))) / 2
+            log_pred = np.log(np.maximum(pred, 1))
+            ci_lo = np.exp(log_pred - half_log)
+            ci_hi = np.exp(log_pred + half_log)
 
         result = pd.DataFrame({"pred": pred, "ci_lo90": ci_lo, "ci_hi90": ci_hi})
         if devolver_componentes:
