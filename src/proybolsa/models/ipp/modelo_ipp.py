@@ -30,6 +30,7 @@ import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.vector_ar.vecm import VECM, coint_johansen
 
+from proybolsa.models.ipp.componentes import ARIMADriftIPP
 from proybolsa.models.sarimax_pickle import PickleCompactoSARIMAX
 
 logger = logging.getLogger(__name__)
@@ -432,12 +433,21 @@ HORIZONTE_IPP = Literal["corto", "medio", "largo"]
 
 @dataclass
 class EnsembleIPP:
-    """Ensemble SARIMA + SARIMAX + VECM + LGB para IPP mensual.
+    """Ensemble ARIMA-drift + SARIMAX + VECM + LGB para IPP mensual.
 
     Pesos calibrados por inverse-MSE sobre período de validación.
-    Si VECM no está disponible (sin cointegración), usa solo SARIMA+SARIMAX+LGB.
+    Si VECM no está disponible (sin cointegración), usa solo ARIMA+SARIMAX+LGB.
+
+    El componente univariado es `ARIMADriftIPP`, no el viejo `SARIMABaselineIPP`. El campo se
+    sigue llamando `sarima` y su peso `w_sarima` por compatibilidad: esos nombres viajan en
+    `resumen_ipp.json`, los lee el dashboard y los asume `resumen_modelo()`. Renombrarlos es
+    un cambio aparte.
+
+    Medido sobre 56 orígenes (RMSE, muestra 2015+, drivers congelados):
+        SARIMABaselineIPP (1,1,1) sin drift   h6 8.16   h12 18.46   h24 49.72
+        ARIMADriftIPP     (1,1,0) con drift   h6 7.08   h12 13.50   h24 24.11
     """
-    sarima: SARIMABaselineIPP = field(default_factory=SARIMABaselineIPP)
+    sarima: ARIMADriftIPP = field(default_factory=ARIMADriftIPP)
     sarimax: SARIMAXDriversIPP = field(default_factory=SARIMAXDriversIPP)
     vecm: VECMDriversIPP = field(default_factory=VECMDriversIPP)
     lgb: LGBDriversIPP = field(default_factory=LGBDriversIPP)
@@ -460,7 +470,7 @@ class EnsembleIPP:
         toda la serie para el pronostico de produccion: de lo contrario el forecast
         partiria del fin de df_train (stale) en vez del ultimo dato observado.
         """
-        logger.info("Ajustando SARIMA IPP...")
+        logger.info("Ajustando ARIMA-drift IPP...")
         self.sarima.fit(df_train)
         logger.info("Ajustando SARIMAX IPP...")
         self.sarimax.fit(df_train)
@@ -548,9 +558,23 @@ class EnsembleIPP:
         if self.sesgo_por_horizonte and horizon in self.sesgo_por_horizonte:
             pred = pred - self.sesgo_por_horizonte[horizon]
 
-        # CI: tomar el ancho del SARIMAX (mas conservador)
-        half_log = (np.log(fc_sarimax["ci_hi90"].values.clip(1)) -
-                    np.log(fc_sarimax["ci_lo90"].values.clip(1))) / 2
+        # Ancho del CI: se toma del componente univariado (ARIMA con deriva), no del SARIMAX.
+        #
+        # El comentario original decía "el ancho del SARIMAX (mas conservador)", pero eso
+        # nunca se verificó. Medido con Winkler-90 sobre 56 orígenes (penaliza ancho Y fallos
+        # de cobertura; menor es mejor):
+        #     h=6    h=12    h=24
+        #     56.0   138.6   306.0   SARIMAX
+        #     47.4   109.9   212.1   ARIMA-drift
+        # El SARIMAX era peor en todos los horizontes: el modelo con el peor punto le estaba
+        # dictando la incertidumbre a todo el ensemble.
+        #
+        # Sigue siendo un ancho heredado de un componente, no una calibración: las bandas
+        # nominales al 90% cubren entre 44% y 75% según el horizonte. Eso lo arregla el
+        # calibrador empírico de la Fase 2.4, no este cambio.
+        fc_ancho = fc_sarima if "ci_lo90" in fc_sarima.columns else fc_sarimax
+        half_log = (np.log(fc_ancho["ci_hi90"].values.clip(1)) -
+                    np.log(fc_ancho["ci_lo90"].values.clip(1))) / 2
         log_pred = np.log(np.maximum(pred, 1))
         ci_lo = np.exp(log_pred - half_log)
         ci_hi = np.exp(log_pred + half_log)
