@@ -47,13 +47,19 @@ P_IPP = PROCESSED / "ipp_features_mensual.parquet"
 
 
 def _huella(ruta: Path) -> dict:
-    """Huella de un parquet de entrada, para detectar .pkl obsoletos."""
+    """Huella de un parquet de entrada, para detectar .pkl obsoletos.
+
+    El conteo sale del footer del parquet, no de leer el archivo: `read_parquet(columns=[])`
+    devuelve cero filas, no las filas con cero columnas.
+    """
+    import pyarrow.parquet as pq
+
     st = ruta.stat()
     return {
         "archivo": ruta.name,
         "mtime": round(st.st_mtime, 3),
         "bytes": st.st_size,
-        "n_filas": int(len(pd.read_parquet(ruta, columns=[]))),
+        "n_filas": int(pq.ParquetFile(ruta).metadata.num_rows),
     }
 
 
