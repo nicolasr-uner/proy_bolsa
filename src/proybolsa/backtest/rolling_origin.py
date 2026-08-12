@@ -71,17 +71,47 @@ def _cobertura_ci(
     return float(dentro.mean() * 100)
 
 
-def calcular_metricas(errores: pd.DataFrame) -> pd.DataFrame:
+def _ancho_ci(ci_lo: np.ndarray, ci_hi: np.ndarray) -> float:
+    mask = ~(np.isnan(ci_lo) | np.isnan(ci_hi))
+    if mask.sum() == 0:
+        return np.nan
+    return float(np.mean(ci_hi[mask] - ci_lo[mask]))
+
+
+def _winkler(y_true: np.ndarray, ci_lo: np.ndarray, ci_hi: np.ndarray,
+             alpha: float = 0.10) -> float:
+    """Winkler score del intervalo (menor es mejor).
+
+    Penaliza el ancho y castiga las observaciones que caen fuera. Es la métrica que hace
+    falta para no premiar a un intervalo por ser ancho: la cobertura sola se maximiza con
+    bandas absurdas, y el ancho solo se minimiza con bandas que no cubren nada.
+    """
+    mask = ~(np.isnan(y_true) | np.isnan(ci_lo) | np.isnan(ci_hi))
+    if mask.sum() == 0:
+        return np.nan
+    y, lo, hi = y_true[mask], ci_lo[mask], ci_hi[mask]
+    score = hi - lo
+    score = np.where(y < lo, score + 2.0 / alpha * (lo - y), score)
+    score = np.where(y > hi, score + 2.0 / alpha * (y - hi), score)
+    return float(np.mean(score))
+
+
+def calcular_metricas(errores: pd.DataFrame, *, variable: str | None = None,
+                      modelo: str | None = None) -> pd.DataFrame:
     """Agrega los errores detallados en metricas por horizonte.
 
     Parametros
     ----------
-    errores : DataFrame con columnas: horizonte, y_real, y_pred, ci_lo90, ci_hi90
+    errores  : DataFrame con columnas: horizonte, y_real, y_pred, ci_lo90, ci_hi90
+    variable : etiqueta de la serie ('bolsa', 'ipp'). Se emite como columna si se pasa, para
+               que un mismo parquet pueda consolidar backtests de varias series.
+    modelo   : clave del modelo. Debe coincidir con la del registro de modelos.
     """
     grupos = errores.groupby("horizonte")
     rows = []
     for h, g in grupos:
-        rows.append({
+        tiene_ci = "ci_lo90" in g.columns
+        fila = {
             "horizonte": h,
             "n_predicciones": len(g),
             "rmse": _rmse(g["y_real"].values, g["y_pred"].values),
@@ -90,8 +120,19 @@ def calcular_metricas(errores: pd.DataFrame) -> pd.DataFrame:
             "sesgo": _sesgo(g["y_real"].values, g["y_pred"].values),
             "cobertura_ci90_pct": _cobertura_ci(
                 g["y_real"].values, g["ci_lo90"].values, g["ci_hi90"].values
-            ) if "ci_lo90" in g.columns else np.nan,
-        })
+            ) if tiene_ci else np.nan,
+            "ancho_ci90_medio": _ancho_ci(
+                g["ci_lo90"].values, g["ci_hi90"].values
+            ) if tiene_ci else np.nan,
+            "winkler_90": _winkler(
+                g["y_real"].values, g["ci_lo90"].values, g["ci_hi90"].values
+            ) if tiene_ci else np.nan,
+        }
+        if variable is not None:
+            fila["variable"] = variable
+        if modelo is not None:
+            fila["modelo"] = modelo
+        rows.append(fila)
     return pd.DataFrame(rows).sort_values("horizonte").reset_index(drop=True)
 
 
@@ -184,6 +225,27 @@ class RollingOriginBacktest:
     horizontes_evaluar: list[int] = field(default_factory=lambda: [1, 7, 14, 30])
     refit_cada: int = 1
 
+    # --- Alias neutros de periodo ---
+    # El motor cuenta FILAS, no días: con una fila por mes, `min_train_dias=60` significa 60
+    # meses. Solo los nombres mienten. Estos alias permiten usarlo con series mensuales sin
+    # escribir `min_train_dias` para hablar de meses, y sin romper a los llamadores actuales.
+    min_train: int | None = None
+    step: int | None = None
+    etiqueta_periodo: str = "dias"
+
+    # Registrar los pasos 1..h y no solo el paso h. Necesario para calibrar la incertidumbre
+    # por horizonte: con solo el último paso, un backtest de h=24 aporta un dato por origen.
+    registrar_todos_los_pasos: bool = False
+
+    # `range(min_train, n - horizonte_max, step)` descartaba el último origen válido: con
+    # n filas, el corte `n - horizonte_max` todavía deja exactamente `horizonte_max` filas de
+    # test. Con 54 orígenes mensuales, perder uno es el 2% de la muestra.
+    incluir_ultimo_origen: bool = True
+
+    def __post_init__(self) -> None:
+        self._min_train = self.min_train if self.min_train is not None else self.min_train_dias
+        self._step = self.step if self.step is not None else self.step_dias
+
     def evaluar(
         self,
         df: pd.DataFrame,
@@ -213,18 +275,19 @@ class RollingOriginBacktest:
         fechas = pd.to_datetime(df[col_fecha])
 
         n = len(df)
-        origenes = range(self.min_train_dias, n - self.horizonte_max, self.step_dias)
+        tope = n - self.horizonte_max + (1 if self.incluir_ultimo_origen else 0)
+        origenes = range(self._min_train, tope, self._step)
         n_origenes = len(list(origenes))
 
         if n_origenes == 0:
             raise ValueError(
                 f"Sin suficientes datos. Necesitas al menos "
-                f"{self.min_train_dias + self.horizonte_max} filas, tienes {n}."
+                f"{self._min_train + self.horizonte_max} filas, tienes {n}."
             )
 
         logger.info(
-            "Rolling-origin: %d origenes, step=%d dias, horizonte_max=%d",
-            n_origenes, self.step_dias, self.horizonte_max,
+            "Rolling-origin: %d origenes, step=%d %s, horizonte_max=%d",
+            n_origenes, self._step, self.etiqueta_periodo, self.horizonte_max,
         )
 
         errores = []
@@ -237,6 +300,40 @@ class RollingOriginBacktest:
 
             if i % self.refit_cada == 0:
                 modelo = fn_fit(df_train)
+
+            if self.registrar_todos_los_pasos:
+                # UNA proyección a horizonte_max, registrando cada paso 1..h_max. No se
+                # itera `horizontes_evaluar` porque entonces el paso 1 quedaría registrado
+                # una vez por cada h de la lista.
+                h_max = min(self.horizonte_max, len(df_test))
+                if h_max == 0:
+                    continue
+                df_h = df_test.iloc[:h_max]
+                try:
+                    pred_df = fn_predict(modelo, df_h, h_max)
+                    y_real = df_h[col_target].values
+                    y_pred = (pred_df["pred"].values if "pred" in pred_df.columns
+                              else np.asarray(pred_df).ravel())
+                    ci_lo = (pred_df["ci_lo90"].values if "ci_lo90" in pred_df.columns
+                             else np.full(h_max, np.nan))
+                    ci_hi = (pred_df["ci_hi90"].values if "ci_hi90" in pred_df.columns
+                             else np.full(h_max, np.nan))
+                    for paso in range(1, min(h_max, len(y_pred)) + 1):
+                        j = paso - 1
+                        errores.append({
+                            "fecha_corte": fecha_corte,
+                            "horizonte": paso,
+                            "y_real": float(y_real[j]),
+                            "y_pred": float(y_pred[j]),
+                            "ci_lo90": float(ci_lo[j]),
+                            "ci_hi90": float(ci_hi[j]),
+                            "error": float(y_pred[j]) - float(y_real[j]),
+                        })
+                except Exception as exc:
+                    logger.warning("Error en origen=%d (todos los pasos): %s", corte, exc)
+                if verbose and (i + 1) % max(1, n_origenes // 10) == 0:
+                    logger.info("  Progreso: %d/%d origenes", i + 1, n_origenes)
+                continue
 
             for h in self.horizontes_evaluar:
                 if h > len(df_test):
