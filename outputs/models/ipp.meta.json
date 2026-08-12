@@ -1,23 +1,62 @@
 {
   "modelo": "ipp",
-  "fecha_serializacion": "2026-08-12T00:11:31+00:00",
+  "fecha_serializacion": "2026-08-12T01:48:29+00:00",
   "python": "3.12.13",
   "pandas": "2.2.3",
   "numpy": "2.1.3",
   "fuentes": [
     {
       "archivo": "ipp_features_mensual.parquet",
-      "mtime": 1786491627.526,
+      "mtime": 1786493591.753,
       "bytes": 60812,
       "n_filas": 327
     }
   ],
   "resumen": {
-    "w_sarima": 0.085,
-    "w_sarimax": 0.181,
-    "w_vecm": 0.73,
-    "w_lgb": 0.004,
+    "w_sarima": 0.558,
+    "w_sarimax": 0.402,
+    "w_vecm": 0.02,
+    "w_lgb": 0.02,
     "vecm_disponible": true,
-    "n_train": 139
+    "vecm_motivo": "activado: traza rechaza r=0 al 95% con k=1 y se sostiene con k\u00b11",
+    "vecm_k_ar_diff": 1,
+    "n_train": 139,
+    "pesos_calibrados_por_horizonte": true,
+    "componente_univariado": "ARIMADriftIPP",
+    "pesos_por_horizonte": {
+      "1": {
+        "vecm": 0.02,
+        "lgb": 0.02,
+        "sarima": 0.486,
+        "sarimax": 0.474
+      },
+      "3": {
+        "vecm": 0.02,
+        "lgb": 0.02,
+        "sarima": 0.511,
+        "sarimax": 0.449
+      },
+      "6": {
+        "vecm": 0.02,
+        "lgb": 0.02,
+        "sarima": 0.54,
+        "sarimax": 0.42
+      },
+      "12": {
+        "vecm": 0.02,
+        "lgb": 0.02,
+        "sarima": 0.558,
+        "sarimax": 0.402
+      },
+      "24": {
+        "vecm": 0.02,
+        "lgb": 0.02,
+        "sarima": 0.563,
+        "sarimax": 0.397
+      }
+    },
+    "arima_order": "(1, 1, 0)",
+    "arima_trend": "c",
+    "arima_aic": -929.93
   }
 }

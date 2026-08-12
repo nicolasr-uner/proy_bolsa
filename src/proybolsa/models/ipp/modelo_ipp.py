@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 import lightgbm as lgb
@@ -56,6 +57,26 @@ _FEATS_LGB = [
 ]
 
 _VECM_VARS = ["ipp", "brent_cop"]  # sistema 2-variable: más estable con n≈137
+
+# Errores del rolling-origin de donde salen los pesos por horizonte. Lo produce
+# scripts/ejecutar_backtest_ipp.py y se versiona, para que Streamlit Cloud —que no puede
+# correr un backtest— use los mismos pesos que se calibraron en local.
+_RUTA_BACKTEST_IPP = Path(__file__).resolve().parents[3].parent / "outputs" / "backtest" / "errores_ipp.parquet"
+
+
+def _cargar_errores_backtest(ruta: str | Path | None) -> pd.DataFrame | None:
+    """Lee los errores del backtest si existen. Devuelve None si no, sin ruido."""
+    if ruta is None:
+        return None
+    p = Path(ruta)
+    if not p.exists():
+        logger.info("Sin backtest en %s: los pesos usaran el metodo antiguo", p.name)
+        return None
+    try:
+        return pd.read_parquet(p)
+    except Exception as exc:
+        logger.warning("No se pudo leer %s (%s)", p.name, exc)
+        return None
 
 # Columnas sin las cuales los componentes con drivers (SARIMAX, VECM, LGB) no son
 # estimables. `construir_features.py` mergea el IPP con los macros en how="outer", así que
@@ -273,55 +294,160 @@ class SARIMAXDriversIPP(PickleCompactoSARIMAX):
 
 @dataclass
 class VECMDriversIPP:
-    """VECM entre IPP, TRM y Brent. Solo se usa si el test Johansen encuentra cointegracion.
+    """VECM del sistema {log IPP, log brent_cop}, activado solo si la cointegración se sostiene.
 
-    Modela la relacion de largo plazo entre los tres indices (todos en log).
-    El pronostico del IPP extrae la ecuacion correspondiente del sistema.
+    La versión anterior decía "solo se usa si el test Johansen encuentra cointegracion" y hacía
+    exactamente lo contrario: `n_coint = max(1, test["n_cointegrating_vectors"])` imponía rango 1
+    aunque el test devolviera 0, y `self._available = True` se fijaba incondicionalmente. El
+    resultado del test se calculaba y se tiraba. Encima el test corría con `k_ar_diff=2` y la
+    estimación con `k_ar_diff=1`.
+
+    Importa porque no es cosmético: sobre los datos reales la traza rechaza r=0 con k=1 y k=2
+    pero NO con k=3. La cointegración es frágil y depende del rezago, así que activarla siempre
+    le entregaba a este componente un peso alto (0.77 en la última corrida) apoyado en un test
+    que a veces dice lo contrario.
+
+    Condiciones para activar, todas obligatorias:
+      1. k elegido por AIC del VAR en niveles (y se usa EL MISMO en test y estimación).
+      2. La traza rechaza r=0 al 95% con ese k.
+      3. También rechaza al 90% con k±1 (robustez al rezago).
+      4. Al menos `min_obs` observaciones.
+      5. El coeficiente de ajuste alpha de la ecuación del IPP es negativo y significativo:
+         sin corrección de error con el signo correcto, un VECM no es un VECM.
+
+    Si falla cualquiera, `_available=False` y `motivo` explica cuál, para que el dashboard y el
+    resumen puedan decirlo en vez de mostrar un peso sin justificación.
     """
-    k_ar_diff: int = 1
+    k_ar_diff: int | str = "auto"
+    min_obs: int = 80
+    exigir_robustez_k: bool = True
+    exigir_alpha_negativo: bool = True
     _model: object = field(default=None, init=False, repr=False)
-    _n_coint: int = field(default=1, init=False, repr=False)
+    _n_coint: int = field(default=0, init=False, repr=False)
     _available: bool = field(default=False, init=False, repr=False)
+    _k_usado: int = field(default=1, init=False, repr=False)
+    _motivo: str = field(default="sin ajustar", init=False, repr=False)
+    # Distingue "se pudo estimar" de "es valido para el pronostico oficial". Solo el modo
+    # escenario usa un VECM estimable pero no validado.
+    _estimable: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def motivo(self) -> str:
+        return self._motivo
+
+    def _desactivar(self, motivo: str, *, estimar_igual: bool = False,
+                    data_log=None, k: int = 1) -> "VECMDriversIPP":
+        """Marca el componente como no válido para el pronóstico oficial.
+
+        `estimar_igual=True` ajusta el modelo de todos modos y lo deja accesible **solo** para
+        el modo escenario. Motivo: el VECM es el único componente con un canal real hacia los
+        drivers (spread medido a 24 meses ante TRM/Brent ±20%: VECM +39.92, SARIMAX +0.87,
+        ARIMA 0.00), así que apagarlo del todo deja los sliders del dashboard inertes. Se
+        conserva para responder "cuánto se movería", no para decir "cuánto va a valer".
+        """
+        self._available = False
+        self._n_coint = 0
+        self._motivo = motivo
+        if estimar_igual and data_log is not None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    self._model = VECM(data_log.values, k_ar_diff=k, coint_rank=1,
+                                       deterministic="ci").fit()
+                self._estimable = True
+                self._k_usado = k
+            except Exception as exc:
+                logger.debug("VECM: tampoco se pudo estimar para escenarios (%s)", exc)
+                self._model = None
+                self._estimable = False
+        else:
+            self._model = None
+            self._estimable = False
+        logger.info("VECM IPP no validado para el pronostico: %s%s", motivo,
+                    " (se conserva para escenarios)" if self._estimable else "")
+        return self
 
     def fit(self, df_train: pd.DataFrame) -> "VECMDriversIPP":
+        from proybolsa.models.ipp.diagnosticos import (
+            decidir_cointegracion,
+            johansen_reporte,
+            seleccionar_k_ar_diff,
+        )
+
         df = df_train.copy()
         if "brent_cop" not in df.columns:
             if "brent" in df.columns and "trm" in df.columns:
                 df["brent_cop"] = df["brent"] * df["trm"]
             else:
-                logger.warning("VECM no disponible: falta brent_cop (o brent+trm)")
-                self._available = False
-                return self
+                return self._desactivar("falta brent_cop (o brent+trm)")
 
-        if "ipp" not in df.columns or len(df) < 20:
-            logger.warning("VECM no disponible: falta ipp o datos insuficientes")
-            self._available = False
-            return self
+        if "ipp" not in df.columns:
+            return self._desactivar("falta la columna ipp")
 
         data = df[["ipp", "brent_cop"]].dropna()
-        if len(data) < 20:
-            self._available = False
-            return self
+        if len(data) < self.min_obs:
+            return self._desactivar(f"muestra insuficiente ({len(data)} < {self.min_obs} obs)")
 
         data_log = np.log(data.astype(float))
 
-        # Test de cointegración {IPP, brent_cop}
-        test = johansen_cointegracion(df)
-        n_coint = max(1, test["n_cointegrating_vectors"])
+        # 1. Rezago por AIC del VAR en niveles.
+        if self.k_ar_diff == "auto":
+            try:
+                k = seleccionar_k_ar_diff(data_log)
+            except Exception as exc:
+                logger.warning("VECM: selección de k falló (%s); se usa k=1", exc)
+                k = 1
+        else:
+            k = int(self.k_ar_diff)
 
+        # 2-3. Johansen con k y sus vecinos, y la regla de decisión.
+        grid = tuple(sorted({max(1, k - 1), k, k + 1})) if self.exigir_robustez_k else (k,)
+        reporte = johansen_reporte(data, ("ipp", "brent_cop"), k_ar_diff_grid=grid)
+        decision = decidir_cointegracion(reporte, k, len(data), min_obs=self.min_obs)
+        if not decision["activar"]:
+            return self._desactivar(decision["motivo"], estimar_igual=True,
+                                    data_log=data_log, k=k)
+
+        # 4. Estimar con EL MISMO k que se testeó.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model = VECM(data_log.values, k_ar_diff=self.k_ar_diff,
-                         coint_rank=n_coint, deterministic="ci")
-            self._model = model.fit()
+            modelo = VECM(data_log.values, k_ar_diff=k,
+                          coint_rank=decision["rango"], deterministic="ci")
+            ajustado = modelo.fit()
 
-        self._n_coint = n_coint
+        # 5. El término de corrección de error debe tirar del IPP hacia el equilibrio.
+        if self.exigir_alpha_negativo:
+            try:
+                alpha = float(np.asarray(ajustado.alpha)[0, 0])
+                p_alpha = float(np.asarray(ajustado.pvalues_alpha)[0, 0])
+            except Exception:
+                alpha, p_alpha = np.nan, np.nan
+            if not (np.isfinite(alpha) and alpha < 0 and np.isfinite(p_alpha) and p_alpha < 0.10):
+                return self._desactivar(
+                    f"el ajuste al equilibrio no tiene el signo correcto o no es significativo "
+                    f"(alpha={alpha:.4f}, p={p_alpha:.3f}); sin correccion de error no es un VECM",
+                    estimar_igual=True, data_log=data_log, k=k,
+                )
+
+        self._model = ajustado
+        self._n_coint = decision["rango"]
+        self._k_usado = k
         self._available = True
-        logger.debug("VECM IPP ajustado. Rango cointegración=%d", n_coint)
+        self._estimable = True
+        self._motivo = f"activado: {decision['motivo']}"
+        logger.info("VECM IPP activado (k=%d, rango=%d)", k, decision["rango"])
         return self
 
-    def forecast(self, horizon: int, brent_cop_future=None) -> pd.DataFrame | None:
-        if not self._available or self._model is None:
+    def forecast(self, horizon: int, brent_cop_future=None, *,
+                 permitir_no_validado: bool = False) -> pd.DataFrame | None:
+        """Pronóstico del VECM, o None si el componente no es utilizable.
+
+        `permitir_no_validado=True` lo usa **solo** el modo escenario: devuelve el forecast de
+        un VECM que se pudo estimar pero cuya cointegración no pasó la regla de activación.
+        Sirve para medir sensibilidad a los drivers, no para el pronóstico oficial.
+        """
+        utilizable = self._available or (permitir_no_validado and self._estimable)
+        if not utilizable or self._model is None:
             return None
 
         if brent_cop_future is None:
@@ -457,11 +583,28 @@ class EnsembleIPP:
     w_lgb: float = 0.25
     sesgo_por_horizonte: dict = field(default_factory=dict)
 
+    # Pesos por horizonte, calibrados desde el backtest rolling-origin.
+    # {h: {"sarima": w, "sarimax": w, "vecm": w, "lgb": w}}
+    pesos_por_horizonte: dict = field(default_factory=dict)
+    # Encogimiento hacia pesos iguales: w = (1-a)*w_invmse + a*(1/4), con a = lambda/(n+lambda).
+    # Con ~56 orígenes y h=24 hay apenas ~2 bloques independientes de 24 meses, así que el MSE
+    # ahí es casi ruido y el inverse-MSE crudo produce pesos absurdos.
+    lambda_shrink: float = 10.0
+    piso_peso: float = 0.02
+
+    _CLAVES_BACKTEST = {
+        "sarima": "ipp_arima_drift",
+        "sarimax": "ipp_sarimax_actual",
+        "vecm": "ipp_vecm",
+        "lgb": "ipp_lgb_actual",
+    }
+
     def fit(
         self,
         df_train: pd.DataFrame,
         df_val: pd.DataFrame | None = None,
         df_full: pd.DataFrame | None = None,
+        errores_backtest: pd.DataFrame | None = None,
     ) -> "EnsembleIPP":
         """Ajusta los 4 componentes y calibra pesos.
 
@@ -479,7 +622,17 @@ class EnsembleIPP:
         logger.info("Ajustando LGB IPP...")
         self.lgb.fit(df_train)
 
-        if df_val is not None and len(df_val) >= 3:
+        # Preferencia de calibración: el backtest rolling-origin por encima de `_calibrar_pesos`.
+        # El segundo mezcla horizontes y le da foresight perfecto al SARIMAX (ver el docstring
+        # de calibrar_pesos_desde_backtest), así que solo se usa si no hay backtest disponible.
+        if errores_backtest is not None and not errores_backtest.empty:
+            self.calibrar_pesos_desde_backtest(errores_backtest)
+        elif df_val is not None and len(df_val) >= 3:
+            logger.warning(
+                "Sin backtest disponible: se calibran los pesos con el metodo antiguo "
+                "(mezcla horizontes y usa foresight perfecto). Corra "
+                "scripts/ejecutar_backtest_ipp.py para calibrar sobre el rolling-origin."
+            )
             self._calibrar_pesos(df_val)
         else:
             self._normalizar_pesos()
@@ -501,6 +654,145 @@ class EnsembleIPP:
             self.w_lgb = 0.3
         logger.info("Pesos IPP: SARIMA=%.2f SARIMAX=%.2f VECM=%.2f LGB=%.2f",
                     self.w_sarima, self.w_sarimax, self.w_vecm, self.w_lgb)
+
+    def calibrar_pesos_desde_backtest(self, errores: pd.DataFrame,
+                                      horizontes: tuple[int, ...] = (1, 3, 6, 12, 24)
+                                      ) -> "EnsembleIPP":
+        """Calibra pesos inverse-MSE **por horizonte** desde el backtest rolling-origin.
+
+        Reemplaza a `_calibrar_pesos`, que era insalvable por tres motivos:
+
+        1. Comparaba horizontes distintos. SARIMA/SARIMAX/VECM producían un forecast de ~21
+           pasos desde el fin de train, mientras `self.lgb.predict(df_val)` predecía ~1 paso
+           alimentado con los `ipp_lag1m/2m/3m` REALES de cada mes de validación. Los MSE no
+           eran comparables.
+        2. Le pasaba `exog_future=df_val` al SARIMAX: foresight perfecto de los drivers, que en
+           producción no existe.
+        3. Un solo origen y pesos constantes para todo h entre 1 y 24, cuando el mejor modelo
+           a 1 mes y a 24 meses no tiene por qué ser el mismo.
+
+        Aquí cada componente se evaluó por separado en multi-paso real con drivers congelados,
+        sobre los mismos orígenes, y los pesos salen de esos errores por horizonte.
+        """
+        req = {"modelo", "horizonte", "error"}
+        if errores is None or errores.empty or not req <= set(errores.columns):
+            logger.warning("Backtest no utilizable para calibrar pesos (faltan %s)",
+                           req - set(errores.columns if errores is not None else []))
+            return self
+
+        disponibles = set(errores["modelo"].unique())
+        faltan = {k: v for k, v in self._CLAVES_BACKTEST.items() if v not in disponibles}
+        if faltan:
+            logger.warning("Sin backtest para %s; esos componentes van con peso igual",
+                           sorted(faltan.values()))
+
+        nuevos: dict[int, dict[str, float]] = {}
+        for h in horizontes:
+            eh = errores[errores["horizonte"] == h]
+            if eh.empty:
+                continue
+            mses: dict[str, float] = {}
+            for comp, clave in self._CLAVES_BACKTEST.items():
+                e = eh.loc[eh["modelo"] == clave, "error"].dropna()
+                if len(e) >= 5:
+                    mses[comp] = float(np.mean(e.to_numpy() ** 2))
+            if len(mses) < 2:
+                continue
+
+            n_orig = int(eh.groupby("modelo").size().max())
+            inv = {k: 1.0 / (v + 1e-9) for k, v in mses.items()}
+            total = sum(inv.values())
+            w = {k: v / total for k, v in inv.items()}
+
+            # Encogimiento hacia pesos iguales.
+            a = self.lambda_shrink / (n_orig + self.lambda_shrink)
+            igual = 1.0 / len(w)
+            w = {k: (1 - a) * v + a * igual for k, v in w.items()}
+
+            # Los componentes sin backtest entran con el piso, no con cero: no se midieron,
+            # que es distinto de haberse medido mal.
+            #
+            # El piso se fija DESPUÉS de normalizar y el resto se reparte sobre lo que sobra.
+            # Hacerlo al revés (max(v, piso) y luego dividir por la suma) deja a los
+            # componentes del piso por debajo del piso, porque la suma pasa de 1.
+            for comp in self._CLAVES_BACKTEST:
+                w.setdefault(comp, 0.0)
+            en_piso = {k for k, v in w.items() if v < self.piso_peso}
+            libres = {k: v for k, v in w.items() if k not in en_piso}
+            disponible = 1.0 - self.piso_peso * len(en_piso)
+            s = sum(libres.values())
+
+            final = {k: self.piso_peso for k in en_piso}
+            if libres and s > 0:
+                final.update({k: v / s * disponible for k, v in libres.items()})
+            elif libres:
+                final.update({k: disponible / len(libres) for k in libres})
+            nuevos[int(h)] = final
+
+        if not nuevos:
+            logger.warning("El backtest no produjo pesos utilizables")
+            return self
+
+        self.pesos_por_horizonte = nuevos
+        # Los escalares reflejan el horizonte de referencia (12m) para `resumen_modelo()`,
+        # `resumen_ipp.json` y el dashboard, que esperan un único número por componente.
+        ref = nuevos.get(12) or nuevos[sorted(nuevos)[len(nuevos) // 2]]
+        self.w_sarima, self.w_sarimax = ref["sarima"], ref["sarimax"]
+        self.w_vecm, self.w_lgb = ref["vecm"], ref["lgb"]
+        logger.info("Pesos IPP por horizonte calibrados desde backtest: %s",
+                    {h: {k: round(v, 3) for k, v in w.items()} for h, w in sorted(nuevos.items())})
+        return self
+
+    # Componentes con un canal real hacia los drivers macro. El ARIMA es univariado: su
+    # respuesta a TRM/Brent es exactamente cero por construcción.
+    _COMPONENTES_CON_DRIVERS = ("sarimax", "vecm", "lgb")
+
+    def pesos_escenario(self) -> dict[str, float]:
+        """Pesos del modo escenario: reparto igual entre los componentes con drivers.
+
+        Se usa reparto igual y no los pesos de precisión porque estos últimos dejan al VECM en
+        el piso (0.019), y el VECM es el que aporta casi toda la sensibilidad. El objetivo de
+        este modo no es minimizar error sino que el slider comunique una elasticidad.
+        """
+        vivos = [c for c in self._COMPONENTES_CON_DRIVERS
+                 if c != "vecm" or self.vecm._estimable or self.vecm._available]
+        if not vivos:
+            return self.pesos(12)
+        w = {c: 1.0 / len(vivos) for c in vivos}
+        w.setdefault("sarima", 0.0)
+        for c in ("sarimax", "vecm", "lgb"):
+            w.setdefault(c, 0.0)
+        return w
+
+    def pesos(self, h: int) -> dict[str, float]:
+        """Pesos vigentes para el horizonte `h`, interpolando entre los calibrados."""
+        if not self.pesos_por_horizonte:
+            return {"sarima": self.w_sarima, "sarimax": self.w_sarimax,
+                    "vecm": self.w_vecm, "lgb": self.w_lgb}
+
+        hs = sorted(self.pesos_por_horizonte)
+        if h <= hs[0]:
+            base = dict(self.pesos_por_horizonte[hs[0]])
+        elif h >= hs[-1]:
+            base = dict(self.pesos_por_horizonte[hs[-1]])
+        else:
+            hi = next(x for x in hs if x >= h)
+            lo = max(x for x in hs if x <= h)
+            if lo == hi:
+                base = dict(self.pesos_por_horizonte[lo])
+            else:
+                t = (h - lo) / (hi - lo)
+                a, b = self.pesos_por_horizonte[lo], self.pesos_por_horizonte[hi]
+                base = {k: (1 - t) * a[k] + t * b[k] for k in a}
+
+        # El VECM puede haberse desactivado después de calibrar: su peso se redistribuye.
+        # Solo si ya se INTENTÓ ajustarlo: un ensemble recién construido tiene _available=False
+        # porque nadie lo ha ajustado todavía, y ahí redistribuir sería inventar.
+        ya_evaluado = getattr(self.vecm, "_motivo", "sin ajustar") != "sin ajustar"
+        if ya_evaluado and not self.vecm._available and base.get("vecm", 0) > 0:
+            base["vecm"] = 0.0
+        s = sum(base.values())
+        return {k: v / s for k, v in base.items()} if s > 0 else base
 
     def _calibrar_pesos(self, df_val: pd.DataFrame) -> None:
         y_real = df_val["ipp"].dropna().values
@@ -535,8 +827,24 @@ class EnsembleIPP:
         horizon: int,
         exog_future: pd.DataFrame | None = None,
         devolver_componentes: bool = False,
+        modo: Literal["precision", "escenario"] = "precision",
     ) -> pd.DataFrame:
-        """Pronostica `horizon` meses hacia adelante."""
+        """Pronostica `horizon` meses hacia adelante.
+
+        modo="precision" (default): pesos calibrados por backtest. Es el pronóstico oficial y
+            el que minimiza el error medido.
+        modo="escenario": reparte el peso entre los componentes que SÍ tienen canal hacia los
+            drivers, para que mover TRM/Brent produzca una respuesta informativa. **No es un
+            pronóstico**: es un ejercicio de sensibilidad y la UI debe decirlo.
+
+            Existe porque la sensibilidad a escenarios estaba concentrada en un solo
+            componente. Spread medido a 24 meses ante TRM/Brent ±20%:
+                ARIMA +0.00 (univariado) · SARIMAX +0.87 · VECM +39.92 · LGB +3.71
+            Con los pesos honestos el VECM cae a 0.019 y el spread del ensemble pasa de ~29 a
+            1.18 puntos. Separar los modos es lo que permite tener a la vez un pronóstico
+            defendible y unos sliders que digan algo.
+        """
+        es_escenario = modo == "escenario"
         fc_sarima  = self.sarima.forecast(horizon)
         fc_sarimax = self.sarimax.forecast(horizon, exog_future=exog_future)
         brent_cop_path = (
@@ -544,15 +852,24 @@ class EnsembleIPP:
             if exog_future is not None and "brent_cop" in exog_future.columns
             else None
         )
-        fc_vecm    = self.vecm.forecast(horizon, brent_cop_future=brent_cop_path)
+        fc_vecm = self.vecm.forecast(horizon, brent_cop_future=brent_cop_path,
+                                     permitir_no_validado=es_escenario)
         pred_lgb   = self.lgb.predict(exog_future.iloc[:horizon]) if exog_future is not None and len(exog_future) >= horizon else fc_sarima["pred"].values
 
+        # Los pesos dependen del horizonte: el mejor modelo a 1 mes no tiene por qué serlo a
+        # 24. Si no hay calibración por horizonte, `pesos()` cae a los escalares de siempre.
+        w = self.pesos_escenario() if es_escenario else self.pesos(horizon)
         pred = (
-            self.w_sarima  * fc_sarima["pred"].values  +
-            self.w_sarimax * fc_sarimax["pred"].values +
-            (self.w_vecm   * fc_vecm["pred"].values if fc_vecm is not None else 0) +
-            self.w_lgb     * pred_lgb
+            w["sarima"]  * fc_sarima["pred"].values  +
+            w["sarimax"] * fc_sarimax["pred"].values +
+            (w["vecm"]   * fc_vecm["pred"].values if fc_vecm is not None else 0) +
+            w["lgb"]     * pred_lgb
         )
+        if fc_vecm is None and w.get("vecm", 0) > 0:
+            # El VECM se desactivó tras calibrar: renormalizar para no perder masa.
+            resto = 1.0 - w["vecm"]
+            if resto > 0:
+                pred = pred / resto
 
         # Correccion de sesgo (si fue actualizada)
         if self.sesgo_por_horizonte and horizon in self.sesgo_por_horizonte:
@@ -615,6 +932,7 @@ class PronosticadorIPP:
         df_features: pd.DataFrame,
         val_fraccion: float = 0.15,
         muestra: Literal["drivers", "completa"] = "drivers",
+        ruta_backtest: str | Path | None = _RUTA_BACKTEST_IPP,
     ) -> "PronosticadorIPP":
         """Ajusta el ensemble con la feature matrix mensual.
 
@@ -642,7 +960,8 @@ class PronosticadorIPP:
         df_train = df.iloc[:-n_val]
         df_val   = df.iloc[-n_val:]
         logger.info("IPP: %d meses train, %d meses val", len(df_train), len(df_val))
-        self.modelo.fit(df_train, df_val=df_val, df_full=df)
+        self.modelo.fit(df_train, df_val=df_val, df_full=df,
+                        errores_backtest=_cargar_errores_backtest(ruta_backtest))
         return self
 
     def pronosticar(
@@ -650,6 +969,7 @@ class PronosticadorIPP:
         horizonte_meses: int = 12,
         df_futuro: pd.DataFrame | None = None,
         devolver_componentes: bool = False,
+        modo: Literal["precision", "escenario"] = "precision",
     ) -> pd.DataFrame:
         """Genera el pronóstico de IPP para los próximos `horizonte_meses` meses.
 
@@ -671,6 +991,7 @@ class PronosticadorIPP:
             horizonte_meses,
             exog_future=df_futuro,
             devolver_componentes=devolver_componentes,
+            modo=modo,
         )
         fechas_fc = pd.date_range(
             self._fecha_ultimo + pd.DateOffset(months=1),
@@ -781,11 +1102,29 @@ class PronosticadorIPP:
         return futuro
 
     def resumen_modelo(self) -> dict:
-        return {
-            "w_sarima":  round(self.modelo.w_sarima, 3),
-            "w_sarimax": round(self.modelo.w_sarimax, 3),
-            "w_vecm":    round(self.modelo.w_vecm, 3),
-            "w_lgb":     round(self.modelo.w_lgb, 3),
-            "vecm_disponible": self.modelo.vecm._available,
+        m = self.modelo
+        resumen = {
+            "w_sarima":  round(m.w_sarima, 3),
+            "w_sarimax": round(m.w_sarimax, 3),
+            "w_vecm":    round(m.w_vecm, 3),
+            "w_lgb":     round(m.w_lgb, 3),
+            "vecm_disponible": m.vecm._available,
+            # Por qué el VECM está o no está: antes solo se publicaba el booleano, así que un
+            # peso de 0.77 llegaba al dashboard sin ninguna justificación visible.
+            "vecm_motivo": getattr(m.vecm, "motivo", ""),
+            "vecm_k_ar_diff": getattr(m.vecm, "_k_usado", None),
             "n_train": len(self._df_train) if self._df_train is not None else None,
+            "pesos_calibrados_por_horizonte": bool(m.pesos_por_horizonte),
+            "componente_univariado": type(m.sarima).__name__,
         }
+        if m.pesos_por_horizonte:
+            resumen["pesos_por_horizonte"] = {
+                str(h): {k: round(v, 3) for k, v in w.items()}
+                for h, w in sorted(m.pesos_por_horizonte.items())
+            }
+        diag = getattr(m.sarima, "diagnostico", None)
+        if isinstance(diag, dict) and diag:
+            resumen["arima_order"] = str(diag.get("order"))
+            resumen["arima_trend"] = diag.get("trend")
+            resumen["arima_aic"] = round(float(diag.get("aic", float("nan"))), 2)
+        return resumen

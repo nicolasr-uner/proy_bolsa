@@ -165,12 +165,24 @@ def main() -> int:
     assert not faltan, f"Bolsa: faltan componentes tras recargar: {faltan}"
     print(f"  Bolsa componentes OK: {sorted({'pred_sarimax', 'pred_lgb'})}")
 
+    # La sensibilidad a escenarios se verifica en modo="escenario", no en el pronóstico
+    # oficial. Al calibrar los pesos honestamente, el VECM -que aportaba casi toda la
+    # respuesta a los drivers- quedó en el piso, así que el pronóstico de precisión
+    # deliberadamente NO se mueve mucho con los sliders.
     fut_alto = i2.construir_futuro_drivers(24, trm_var_anual=0.20, brent_var_anual=0.20)
     fut_bajo = i2.construir_futuro_drivers(24, trm_var_anual=-0.20, brent_var_anual=-0.20)
-    a = i2.pronosticar(24, df_futuro=fut_alto)["pred"].iloc[-1]
-    b = i2.pronosticar(24, df_futuro=fut_bajo)["pred"].iloc[-1]
-    assert abs(a - b) > 5.0, "IPP: el escenario debe mover el pronóstico tras recargar"
+    a = i2.pronosticar(24, df_futuro=fut_alto, modo="escenario")["pred"].iloc[-1]
+    b = i2.pronosticar(24, df_futuro=fut_bajo, modo="escenario")["pred"].iloc[-1]
+    assert abs(a - b) > 5.0, "IPP: el modo escenario debe mover el pronóstico tras recargar"
     print(f"  IPP escenarios OK: alto={a:.2f}  bajo={b:.2f}  spread={a-b:+.2f}")
+
+    resumen_i2 = i2.resumen_modelo()
+    print(f"  IPP pesos (h=12): arima={resumen_i2['w_sarima']:.3f} "
+          f"sarimax={resumen_i2['w_sarimax']:.3f} vecm={resumen_i2['w_vecm']:.3f} "
+          f"lgb={resumen_i2['w_lgb']:.3f}")
+    if not resumen_i2.get("pesos_calibrados_por_horizonte"):
+        print("  AVISO: los pesos del IPP NO vienen del backtest. Corra "
+              "scripts/ejecutar_backtest_ipp.py y vuelva a serializar.")
 
     print(f"OK — modelos serializados y verificados. Meta: {meta_b.name}, {meta_i.name}")
     return 0

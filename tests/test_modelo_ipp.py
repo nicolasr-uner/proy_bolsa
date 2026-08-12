@@ -193,17 +193,127 @@ class TestVECMDriversIPP:
         fc_alto = m.forecast(12, brent_cop_future=np.full(12, last_bc * 2.0))
         assert not np.allclose(fc_bajo["pred"].values, fc_alto["pred"].values, rtol=1e-3)
 
-    def test_ensemble_spread_material_con_escenarios_extremos(self):
-        """Con VECM condicional, el spread absoluto del ensemble alto vs bajo a 24m es >5 pts."""
+    def test_los_escenarios_mueven_el_pronostico_en_modo_escenario(self):
+        """Mover los drivers debe producir una respuesta no trivial en el modo escenario.
+
+        Este test exigía antes un spread > 5 puntos al pronóstico **por defecto**, y eso dejó
+        de ser cierto al calibrar los pesos honestamente. Medida de dónde venía la
+        sensibilidad (spread a 24m ante TRM/Brent ±20%, datos REALES):
+
+            ARIMA +0.00 (univariado)  SARIMAX +0.87  VECM +39.92  LGB +3.71
+
+        Casi toda venía del VECM, el componente cuya cointegración el test de Johansen no
+        sostiene y que por eso ahora pesa 0.019 en el pronóstico oficial.
+
+        El umbral de 5 puntos es una propiedad de la serie real, no un invariante: sobre el
+        fixture sintético de 60 meses el sistema no está fuertemente cointegrado y el spread
+        legítimamente es menor. La comprobación de magnitud vive en
+        `scripts/serializar_modelos.py`, que corre sobre datos reales (medido: +14.83 pts).
+        Aquí se fija lo que sí debe cumplirse siempre.
+        """
         df = _df_ipp_sintetico(60)
         p = PronosticadorIPP()
-        p.fit(df)
+        p.fit(df, ruta_backtest=None)
         fut_alto = p.construir_futuro_drivers(24, trm_var_anual=0.20, brent_var_anual=0.20)
         fut_bajo = p.construir_futuro_drivers(24, trm_var_anual=-0.20, brent_var_anual=-0.20)
-        fc_alto = p.pronosticar(24, df_futuro=fut_alto)
-        fc_bajo = p.pronosticar(24, df_futuro=fut_bajo)
-        spread_abs = abs(float(fc_alto["pred"].iloc[-1] - fc_bajo["pred"].iloc[-1]))
-        assert spread_abs > 5.0
+        alto = float(p.pronosticar(24, df_futuro=fut_alto, modo="escenario")["pred"].iloc[-1])
+        bajo = float(p.pronosticar(24, df_futuro=fut_bajo, modo="escenario")["pred"].iloc[-1])
+
+        assert abs(alto - bajo) > 0.5, "los drivers no mueven nada: el canal está roto"
+        assert alto > bajo, "TRM y Brent al alza deben empujar el IPP hacia arriba"
+
+    def test_modo_escenario_ignora_el_componente_univariado(self):
+        """La garantía estructural del modo escenario.
+
+        No se puede prometer que el spread sea mayor que en modo precisión —eso depende de
+        qué pesos haya dado la calibración—, pero sí que el ARIMA, que es univariado y tiene
+        respuesta exactamente cero a los drivers, no diluya el ejercicio.
+        """
+        df = _df_ipp_sintetico(60)
+        p = PronosticadorIPP()
+        p.fit(df, ruta_backtest=None)
+
+        w = p.modelo.pesos_escenario()
+        assert w["sarima"] == 0.0, "el univariado no debe participar del modo escenario"
+        assert sum(w.values()) == pytest.approx(1.0)
+        assert all(w[c] > 0 for c in ("sarimax", "lgb")), "faltan componentes con drivers"
+
+    def test_el_modo_por_defecto_es_precision(self):
+        """Nadie debe obtener el modo sensibilidad sin pedirlo."""
+        df = _df_ipp_sintetico(60)
+        p = PronosticadorIPP()
+        p.fit(df, ruta_backtest=None)
+        fut = p.construir_futuro_drivers(12, trm_var_anual=0.20, brent_var_anual=0.20)
+        por_defecto = p.pronosticar(12, df_futuro=fut)["pred"].to_numpy()
+        explicito = p.pronosticar(12, df_futuro=fut, modo="precision")["pred"].to_numpy()
+        np.testing.assert_allclose(por_defecto, explicito)
+
+
+class TestPesosPorHorizonte:
+    def test_pesos_varian_con_el_horizonte(self):
+        e = EnsembleIPP()
+        e.pesos_por_horizonte = {
+            1: {"sarima": 0.4, "sarimax": 0.4, "vecm": 0.1, "lgb": 0.1},
+            24: {"sarima": 0.7, "sarimax": 0.2, "vecm": 0.05, "lgb": 0.05},
+        }
+        assert e.pesos(1)["sarima"] == pytest.approx(0.4)
+        assert e.pesos(24)["sarima"] == pytest.approx(0.7)
+
+    def test_interpola_entre_horizontes_calibrados(self):
+        e = EnsembleIPP()
+        e.pesos_por_horizonte = {
+            1: {"sarima": 0.4, "sarimax": 0.4, "vecm": 0.1, "lgb": 0.1},
+            21: {"sarima": 0.8, "sarimax": 0.1, "vecm": 0.05, "lgb": 0.05},
+        }
+        w = e.pesos(11)  # punto medio
+        assert w["sarima"] == pytest.approx(0.6, abs=0.01)
+        assert sum(w.values()) == pytest.approx(1.0)
+
+    def test_extrapola_plano_fuera_del_rango(self):
+        e = EnsembleIPP()
+        e.pesos_por_horizonte = {6: {"sarima": 0.5, "sarimax": 0.3, "vecm": 0.1, "lgb": 0.1}}
+        assert e.pesos(1) == e.pesos(6) == e.pesos(99)
+
+    def test_sin_calibracion_cae_a_los_escalares(self):
+        e = EnsembleIPP()
+        w = e.pesos(12)
+        assert w == {"sarima": 0.25, "sarimax": 0.25, "vecm": 0.25, "lgb": 0.25}
+
+    def test_los_pesos_siempre_suman_uno(self):
+        e = EnsembleIPP()
+        e.pesos_por_horizonte = {
+            1: {"sarima": 0.4, "sarimax": 0.4, "vecm": 0.1, "lgb": 0.1},
+            12: {"sarima": 0.6, "sarimax": 0.3, "vecm": 0.05, "lgb": 0.05},
+        }
+        for h in (1, 3, 6, 12, 24, 36):
+            assert sum(e.pesos(h).values()) == pytest.approx(1.0), f"h={h}"
+
+    def test_calibrar_desde_backtest_favorece_al_de_menor_error(self):
+        """El componente con menos error debe salir con más peso."""
+        filas = []
+        for origen in range(20):
+            filas += [
+                {"modelo": "ipp_arima_drift", "horizonte": 12, "error": 1.0, "fecha_corte": origen},
+                {"modelo": "ipp_sarimax_actual", "horizonte": 12, "error": 5.0, "fecha_corte": origen},
+            ]
+        e = EnsembleIPP().calibrar_pesos_desde_backtest(pd.DataFrame(filas), horizontes=(12,))
+        w = e.pesos(12)
+        assert w["sarima"] > w["sarimax"], "el de menor error debe pesar más"
+        assert sum(w.values()) == pytest.approx(1.0)
+
+    def test_componente_sin_backtest_recibe_el_piso_no_cero(self):
+        """No medido no es lo mismo que medido mal."""
+        filas = [{"modelo": "ipp_arima_drift", "horizonte": 12, "error": 1.0, "fecha_corte": i}
+                 for i in range(20)]
+        filas += [{"modelo": "ipp_sarimax_actual", "horizonte": 12, "error": 2.0, "fecha_corte": i}
+                  for i in range(20)]
+        e = EnsembleIPP().calibrar_pesos_desde_backtest(pd.DataFrame(filas), horizontes=(12,))
+        assert e.pesos(12)["vecm"] >= e.piso_peso
+
+    def test_backtest_vacio_no_rompe_ni_calibra(self):
+        e = EnsembleIPP()
+        e.calibrar_pesos_desde_backtest(pd.DataFrame())
+        assert not e.pesos_por_horizonte
 
 
 # ---------------------------------------------------------------------------

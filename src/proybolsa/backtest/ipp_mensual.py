@@ -192,8 +192,21 @@ def _llamar_forecast(modelo, horizon: int, exog: pd.DataFrame | None) -> pd.Data
     fn = getattr(modelo, "forecast", None) or getattr(modelo, "predict")
     params = inspect.signature(fn).parameters
     if "exog_future" in params and exog is not None:
-        return fn(horizon, exog_future=exog)
-    return fn(horizon)
+        fc = fn(horizon, exog_future=exog)
+    elif "brent_cop_future" in params and exog is not None and "brent_cop" in exog.columns:
+        # VECM: su forecast condicional recibe la trayectoria del driver, no un DataFrame.
+        fc = fn(horizon, brent_cop_future=exog["brent_cop"].to_numpy()[:horizon])
+    else:
+        fc = fn(horizon)
+
+    if fc is None:
+        # El VECM devuelve None cuando su regla de activación no se cumple. Es un resultado
+        # legítimo, no un error: se registra como NaN para que el origen cuente en el
+        # denominador sin inventar un número.
+        return pd.DataFrame({"pred": np.full(horizon, np.nan),
+                             "ci_lo90": np.full(horizon, np.nan),
+                             "ci_hi90": np.full(horizon, np.nan)})
+    return fc
 
 
 @dataclass
@@ -222,8 +235,10 @@ def _fabricas() -> dict[str, Callable[[], object]]:
     """Registro de modelos backtesteables. La clave es la que va a la columna `modelo`."""
     from proybolsa.models.ipp.modelo_ipp import (
         EnsembleIPP,
+        LGBDriversIPP,
         SARIMABaselineIPP,
         SARIMAXDriversIPP,
+        VECMDriversIPP,
     )
 
     fabricas: dict[str, Callable[[], object]] = {
@@ -236,6 +251,10 @@ def _fabricas() -> dict[str, Callable[[], object]]:
         "ipp_sarima_actual": SARIMABaselineIPP,
         "ipp_sarimax_actual": SARIMAXDriversIPP,
         "ipp_ensemble_actual": EnsembleIPP,
+        # Componentes sueltos del ensemble: hacen falta medidos por separado para poder
+        # calibrar los pesos por horizonte sin foresight ni mezcla de horizontes.
+        "ipp_vecm": VECMDriversIPP,
+        "ipp_lgb_actual": LGBDriversIPP,
     }
 
     # Modelos nuevos: se registran solo si el módulo existe, para que este archivo funcione
