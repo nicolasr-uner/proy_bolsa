@@ -6,6 +6,7 @@ para testear sin tocar outputs/ reales.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,8 @@ import pandas as pd
 from proybolsa.torneo.evaluacion import agregar_leaderboard, resolver
 from proybolsa.torneo.panel import HORIZONTES, pronosticar_panel
 from proybolsa.torneo.registro import cargar_registro, registrar_panel
+
+logger = logging.getLogger(__name__)
 
 
 def correr_ciclo_torneo(df: pd.DataFrame, dir_salida: str | Path, fecha_run: str,
@@ -24,6 +27,9 @@ def correr_ciclo_torneo(df: pd.DataFrame, dir_salida: str | Path, fecha_run: str
     r_lb = dir_salida / "leaderboard_ipp.parquet"
 
     df = df.sort_values("fecha").dropna(subset=["ipp"]).reset_index(drop=True)
+    if df.empty:
+        logger.warning("Torneo IPP: sin IPP real disponible; se omite el ciclo")
+        return
     origen = df["fecha"].iloc[-1]
 
     # 1. PUNTEAR: resolver el registro previo contra los IPP reales conocidos hoy.

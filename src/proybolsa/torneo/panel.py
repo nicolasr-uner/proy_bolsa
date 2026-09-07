@@ -6,6 +6,7 @@ ensemble entra con sus pesos de produccion (fit con errores_backtest); el resto 
 """
 from __future__ import annotations
 
+import logging
 import warnings
 
 import numpy as np
@@ -18,6 +19,8 @@ from proybolsa.backtest.ipp_mensual import (
 )
 
 HORIZONTES = (1, 3, 6, 12, 24)
+
+logger = logging.getLogger(__name__)
 
 
 def _marco_futuro(train: pd.DataFrame, origen_fecha: pd.Timestamp, h_max: int) -> pd.DataFrame:
@@ -47,14 +50,27 @@ def pronosticar_panel(df: pd.DataFrame, origen_fecha, horizontes=HORIZONTES,
 
     filas = []
     for nombre, fabrica in fabricas_ipp().items():
-        modelo = fabrica()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            if nombre == "ipp_ensemble":
-                modelo.fit(train, errores_backtest=errores_backtest)
-            else:
-                modelo.fit(train)
-            fc = _llamar_forecast(modelo, h_max, exog)
+        try:
+            modelo = fabrica()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if nombre == "ipp_ensemble":
+                    modelo.fit(train, errores_backtest=errores_backtest)
+                else:
+                    modelo.fit(train)
+                fc = _llamar_forecast(modelo, h_max, exog)
+        except Exception:
+            logger.exception("Torneo IPP: el modelo '%s' fallo en fit/forecast; se registra NaN", nombre)
+            for h in horizontes:
+                filas.append({
+                    "modelo": nombre,
+                    "horizonte": h,
+                    "fecha_objetivo": pd.Timestamp(fechas_obj[h - 1]),
+                    "y_pred": np.nan,
+                    "ci_lo90": np.nan,
+                    "ci_hi90": np.nan,
+                })
+            continue
         for h in horizontes:
             filas.append({
                 "modelo": nombre,

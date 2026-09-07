@@ -45,3 +45,26 @@ def test_panel_no_deja_pasar_el_futuro(df_ipp):
     v1 = p1[p1.modelo == m]["y_pred"].iloc[0]
     v2 = p2[p2.modelo == m]["y_pred"].iloc[0]
     assert v1 == pytest.approx(v2), "el SARIMAX vio el futuro: hay fuga"
+
+
+def test_panel_aisla_fallos_por_modelo(df_ipp, monkeypatch):
+    """Si un modelo del panel lanza excepcion, el panel sigue con los demas (NaN para el que fallo)."""
+    from proybolsa.torneo import panel as panel_mod
+
+    class _ModeloRoto:
+        def fit(self, *a, **k):
+            raise RuntimeError("modelo roto a proposito")
+
+    def _fabricas_con_uno_roto():
+        from proybolsa.backtest.ipp_mensual import DriftIPP
+        return {"ipp_bench_drift": DriftIPP, "ipp_roto": _ModeloRoto}
+
+    monkeypatch.setattr(panel_mod, "fabricas_ipp", _fabricas_con_uno_roto)
+    origen = df_ipp["fecha"].iloc[-1]
+    p = panel_mod.pronosticar_panel(df_ipp, origen_fecha=origen, horizontes=(1, 6))
+    # el modelo bueno tiene predicciones finitas
+    buenos = p[p["modelo"] == "ipp_bench_drift"]
+    assert len(buenos) == 2 and np.isfinite(buenos["y_pred"]).all()
+    # el modelo roto quedo registrado con NaN, no tumbo el panel
+    rotos = p[p["modelo"] == "ipp_roto"]
+    assert len(rotos) == 2 and rotos["y_pred"].isna().all()

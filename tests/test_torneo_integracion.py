@@ -34,3 +34,12 @@ def test_ciclo_es_idempotente(df_ipp, tmp_path):
     correr_ciclo_torneo(hist, dir_salida=tmp_path, fecha_run="20260101", horizontes=(1,))
     n2 = len(pd.read_parquet(tmp_path / "registro_ipp.parquet"))
     assert n1 == n2, "re-correr el mismo ciclo no debe duplicar el registro"
+
+
+def test_ciclo_con_ipp_todo_nan_no_crashea(df_ipp, tmp_path):
+    from proybolsa.torneo.ciclo import correr_ciclo_torneo
+    vacio = df_ipp.copy()
+    vacio["ipp"] = np.nan
+    # no debe lanzar; simplemente no hace nada
+    correr_ciclo_torneo(vacio, dir_salida=tmp_path, fecha_run="20260101", horizontes=(1,))
+    assert not (tmp_path / "registro_ipp.parquet").exists()
