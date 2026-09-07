@@ -647,6 +647,7 @@ class EnsembleIPP:
         df_full: pd.DataFrame | None = None,
         errores_backtest: pd.DataFrame | None = None,
         permitir_calibracion_con_fuga: bool = False,
+        estrategia_pesos: Literal["inverse_mse", "campeon"] = "inverse_mse",
     ) -> "EnsembleIPP":
         """Ajusta los 4 componentes y calibra pesos.
 
@@ -677,8 +678,15 @@ class EnsembleIPP:
         # horizontes), así que NO corre por defecto: hay que pedirla explícitamente. Sin backtest,
         # los pesos quedan en el reparto por defecto en vez de calibrarse contra el futuro real.
         if errores_backtest is not None and not errores_backtest.empty:
-            self.calibrar_pesos_desde_backtest(errores_backtest)
-            self.calibrar_intervalos_desde_backtest(errores_backtest)
+            if estrategia_pesos == "campeon":
+                # Desplegar el mejor componente por horizonte. Medido: el ensemble ponderado
+                # pierde contra su mejor parte (arima_drift) en todo horizonte, y ningun
+                # shrinkage lo salva. Las bandas se calibran sobre el campeon, no sobre el mix.
+                self.fijar_pesos_campeon(errores_backtest)
+                self.calibrar_intervalos_desde_backtest(errores_backtest, preferir="ipp_arima_drift")
+            else:
+                self.calibrar_pesos_desde_backtest(errores_backtest)
+                self.calibrar_intervalos_desde_backtest(errores_backtest)
         elif permitir_calibracion_con_fuga and df_val is not None and len(df_val) >= 3:
             logger.warning(
                 "Calibrando pesos con FUGA DE DATOS por opt-in explícito "
@@ -805,16 +813,61 @@ class EnsembleIPP:
     # respuesta a TRM/Brent es exactamente cero por construcción.
     _COMPONENTES_CON_DRIVERS = ("sarimax", "vecm", "lgb")
 
-    def calibrar_intervalos_desde_backtest(self, errores: pd.DataFrame) -> "EnsembleIPP":
+    def fijar_pesos_campeon(self, errores: pd.DataFrame,
+                            horizontes: tuple[int, ...] = (1, 3, 6, 12, 24)) -> "EnsembleIPP":
+        """Estrategia 'pick-the-winner': en cada horizonte, todo el peso al componente con
+        menor RMSE en el backtest rolling-origin.
+
+        Reponderar el ensemble (inverse-MSE, cualquier shrinkage) no bate a su mejor componente
+        cuando los errores estan correlacionados (medido 2026-09-07: el ensemble pierde contra
+        arima_drift en todo horizonte). Desplegar el campeon es lo honesto; el torneo de modelos
+        mide el panel en vivo y esta calibracion se auto-adapta si otro componente gana.
+        """
+        req = {"modelo", "horizonte", "error"}
+        if errores is None or errores.empty or not req <= set(errores.columns):
+            logger.warning("Backtest no utilizable para fijar el campeon (faltan %s)",
+                           req - set(errores.columns if errores is not None else []))
+            return self
+
+        nuevos: dict[int, dict[str, float]] = {}
+        for h in horizontes:
+            eh = errores[errores["horizonte"] == h]
+            rmses: dict[str, float] = {}
+            for comp, clave in self._CLAVES_BACKTEST.items():
+                e = eh.loc[eh["modelo"] == clave, "error"].dropna()
+                if len(e) >= 5:
+                    rmses[comp] = float(np.sqrt(np.mean(e.to_numpy() ** 2)))
+            if not rmses:
+                continue
+            campeon = min(rmses, key=rmses.get)
+            nuevos[h] = {c: (1.0 if c == campeon else 0.0) for c in self._CLAVES_BACKTEST}
+
+        if nuevos:
+            self.pesos_por_horizonte = nuevos
+            base = nuevos.get(12) or next(iter(nuevos.values()))
+            self.w_sarima = base.get("sarima", 0.0)
+            self.w_sarimax = base.get("sarimax", 0.0)
+            self.w_vecm = base.get("vecm", 0.0)
+            self.w_lgb = base.get("lgb", 0.0)
+            logger.info("IPP campeon por horizonte: %s",
+                        {h: max(w, key=w.get) for h, w in nuevos.items()})
+        return self
+
+    def calibrar_intervalos_desde_backtest(self, errores: pd.DataFrame,
+                                           preferir: str | None = None) -> "EnsembleIPP":
         """Calibra las bandas con los cuantiles empíricos del error del rolling-origin.
 
         Reemplaza el trasplante del ancho de un componente. Las bandas nominales del 90%
         cubrían entre 44% y 75% según horizonte: no eran intervalos del 90%.
+
+        `preferir` (p. ej. "ipp_arima_drift") calibra sobre ese modelo primero: se usa cuando
+        el pronostico oficial es el campeon, para que las bandas sean las del modelo desplegado.
         """
         from proybolsa.models.ipp.incertidumbre import CalibradorIntervalos
 
         disponibles = set(errores.get("modelo", pd.Series(dtype=str)).unique())
-        for clave in self._CLAVES_CALIBRACION:
+        orden = ([preferir] if preferir else []) + [c for c in self._CLAVES_CALIBRACION if c != preferir]
+        for clave in orden:
             if clave not in disponibles:
                 continue
             cal = CalibradorIntervalos.desde_errores(errores, clave)
@@ -1021,6 +1074,7 @@ class PronosticadorIPP:
         val_fraccion: float = 0.15,
         muestra: Literal["drivers", "completa"] = "drivers",
         ruta_backtest: str | Path | None = _RUTA_BACKTEST_IPP,
+        estrategia_pesos: Literal["inverse_mse", "campeon"] = "campeon",
     ) -> "PronosticadorIPP":
         """Ajusta el ensemble con la feature matrix mensual.
 
@@ -1049,7 +1103,8 @@ class PronosticadorIPP:
         df_val   = df.iloc[-n_val:]
         logger.info("IPP: %d meses train, %d meses val", len(df_train), len(df_val))
         self.modelo.fit(df_train, df_val=df_val, df_full=df,
-                        errores_backtest=_cargar_errores_backtest(ruta_backtest))
+                        errores_backtest=_cargar_errores_backtest(ruta_backtest),
+                        estrategia_pesos=estrategia_pesos)
         return self
 
     def pronosticar(
