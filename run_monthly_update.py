@@ -258,6 +258,24 @@ def ciclo_ipp(run_dir: Path, fecha_corte: str | None = None) -> None:
         fc12["ci_hi90"].mean(),
     )
 
+    # Torneo de modelos: puntear lo vencido y registrar el panel de este origen.
+    try:
+        from proybolsa.torneo.ciclo import correr_ciclo_torneo
+        from proybolsa.models.ipp.modelo_ipp import (
+            _RUTA_BACKTEST_IPP,
+            _cargar_errores_backtest,
+        )
+
+        correr_ciclo_torneo(
+            df_ipp,
+            dir_salida=OUTPUTS / "torneo",
+            fecha_run=hoy,
+            errores_backtest=_cargar_errores_backtest(_RUTA_BACKTEST_IPP),
+        )
+        logger.info("  Torneo IPP actualizado en outputs/torneo/")
+    except Exception:
+        logger.exception("  El torneo IPP fallo; el ciclo principal continua")
+
 
 # ---------------------------------------------------------------------------
 # Main
