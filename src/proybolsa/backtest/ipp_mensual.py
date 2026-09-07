@@ -231,8 +231,13 @@ class _Adaptador:
             return _llamar_forecast(modelo, h, exog)
 
 
-def _fabricas() -> dict[str, Callable[[], object]]:
-    """Registro de modelos backtesteables. La clave es la que va a la columna `modelo`."""
+def fabricas_ipp() -> dict[str, Callable[[], object]]:
+    """Registro público de modelos backtesteables (panel del torneo IPP).
+
+    La clave es la que va a la columna `modelo`. Es la única definición del panel:
+    tanto `backtest_ipp()` como el módulo del torneo (tareas siguientes) consumen
+    este registro.
+    """
     from proybolsa.models.ipp.modelo_ipp import (
         EnsembleIPP,
         LGBDriversIPP,
@@ -276,6 +281,10 @@ def _fabricas() -> dict[str, Callable[[], object]]:
         if hasattr(_c, attr):
             fabricas[clave] = getattr(_c, attr)
     return fabricas
+
+
+# Alias interno retro-compatible (los llamadores previos usaban el nombre privado).
+_fabricas = fabricas_ipp
 
 
 def backtest_ipp(
