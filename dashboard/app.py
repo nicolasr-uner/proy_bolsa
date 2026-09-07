@@ -814,3 +814,47 @@ with tab_precision:
     > (precio ~800-2000 COP/kWh) al periodo post-Nino 2025-2026 (~465 COP/kWh).
     > El loop mensual lo corrige gradualmente via `actualizar_sesgo()`.
     """)
+
+    # -----------------------------------------------------------------------
+    # Torneo de modelos IPP: leaderboard (historico backtest + track record real)
+    # -----------------------------------------------------------------------
+    from pathlib import Path as _Path
+
+    _OUT_TORNEO = _Path(__file__).resolve().parent.parent / "outputs"
+
+    st.markdown("---")
+    st.subheader("Leaderboard de modelos IPP")
+    st.caption(
+        "Historico = backtest rolling-origin. Track record real = pronosticos publicados "
+        "cada mes, puntuados cuando el IPP real llego (n = cuantos ya vencieron). "
+        "Skill vs. naive (drift) positivo = le gana a 'no hacer casi nada'."
+    )
+
+    _lb_path = _OUT_TORNEO / "torneo" / "leaderboard_ipp.parquet"
+    _lb = pd.read_parquet(_lb_path) if _lb_path.exists() else pd.DataFrame()
+    if _lb.empty:
+        st.info(
+            "Aun no hay pronosticos IPP vencidos: el track record real empieza a acumularse "
+            "con los proximos ciclos mensuales. Debajo, el historico del backtest."
+        )
+    else:
+        st.markdown("**Skill vs. naive (drift) — track record real** (positivo = le gana)")
+        st.dataframe(
+            _lb.pivot_table(index="modelo", columns="horizonte", values="skill_vs_naive").round(3),
+            use_container_width=True,
+        )
+        st.markdown("**Evidencia acumulada (n_resueltos)**")
+        st.dataframe(
+            _lb.pivot_table(index="modelo", columns="horizonte", values="n_resueltos"),
+            use_container_width=True,
+        )
+
+    _bt_path = _OUT_TORNEO / "backtest" / "metricas_ipp.parquet"
+    _bt = pd.read_parquet(_bt_path) if _bt_path.exists() else pd.DataFrame()
+    if not _bt.empty:
+        st.markdown("**Historico (backtest rolling-origin) — RMSE por horizonte**")
+        _vista = _bt[_bt["n_suficiente"]] if "n_suficiente" in _bt.columns else _bt
+        st.dataframe(
+            _vista.pivot_table(index="modelo", columns="horizonte", values="rmse").round(2),
+            use_container_width=True,
+        )
