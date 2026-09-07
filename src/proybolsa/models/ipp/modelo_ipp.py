@@ -637,13 +637,22 @@ class EnsembleIPP:
         df_val: pd.DataFrame | None = None,
         df_full: pd.DataFrame | None = None,
         errores_backtest: pd.DataFrame | None = None,
+        permitir_calibracion_con_fuga: bool = False,
     ) -> "EnsembleIPP":
         """Ajusta los 4 componentes y calibra pesos.
 
-        Los componentes se ajustan sobre df_train y los pesos se calibran sobre df_val
-        (validacion honesta). Si se pasa df_full, los componentes se RE-AJUSTAN sobre
-        toda la serie para el pronostico de produccion: de lo contrario el forecast
-        partiria del fin de df_train (stale) en vez del ultimo dato observado.
+        Los componentes se ajustan sobre df_train. Los pesos se calibran desde
+        `errores_backtest` (rolling-origin honesto). Si NO hay backtest, los pesos quedan en el
+        reparto por defecto (`_normalizar_pesos`), con un aviso para correr el backtest.
+
+        `permitir_calibracion_con_fuga=True` reactiva la ruta antigua `_calibrar_pesos(df_val)`,
+        que mezcla horizontes y le da foresight perfecto de los drivers al SARIMAX (FUGA DE
+        DATOS). Es opt-in explícito y solo para experimentos locales: NUNCA para producción,
+        porque infla el peso de los componentes con exógenas. Antes corría en silencio cuando
+        faltaba el backtest, reintroduciendo esa calibración fraudulenta.
+
+        Si se pasa df_full, los componentes se RE-AJUSTAN sobre toda la serie para el pronostico
+        de produccion: de lo contrario el forecast partiria del fin de df_train (stale).
         """
         logger.info("Ajustando ARIMA-drift IPP...")
         self.sarima.fit(df_train)
@@ -654,20 +663,27 @@ class EnsembleIPP:
         logger.info("Ajustando LGB IPP...")
         self.lgb.fit(df_train)
 
-        # Preferencia de calibración: el backtest rolling-origin por encima de `_calibrar_pesos`.
-        # El segundo mezcla horizontes y le da foresight perfecto al SARIMAX (ver el docstring
-        # de calibrar_pesos_desde_backtest), así que solo se usa si no hay backtest disponible.
+        # Preferencia de calibración: SOLO el backtest rolling-origin. La ruta antigua
+        # `_calibrar_pesos` tiene fuga de datos (foresight perfecto del SARIMAX + mezcla de
+        # horizontes), así que NO corre por defecto: hay que pedirla explícitamente. Sin backtest,
+        # los pesos quedan en el reparto por defecto en vez de calibrarse contra el futuro real.
         if errores_backtest is not None and not errores_backtest.empty:
             self.calibrar_pesos_desde_backtest(errores_backtest)
             self.calibrar_intervalos_desde_backtest(errores_backtest)
-        elif df_val is not None and len(df_val) >= 3:
+        elif permitir_calibracion_con_fuga and df_val is not None and len(df_val) >= 3:
             logger.warning(
-                "Sin backtest disponible: se calibran los pesos con el metodo antiguo "
-                "(mezcla horizontes y usa foresight perfecto). Corra "
-                "scripts/ejecutar_backtest_ipp.py para calibrar sobre el rolling-origin."
+                "Calibrando pesos con FUGA DE DATOS por opt-in explícito "
+                "(permitir_calibracion_con_fuga=True): mezcla horizontes y usa foresight "
+                "perfecto del SARIMAX. Solo para experimentos locales, nunca para producción."
             )
             self._calibrar_pesos(df_val)
         else:
+            if df_val is not None and len(df_val) >= 3:
+                logger.warning(
+                    "Sin errores_backtest: los pesos NO se calibran (quedan en el reparto por "
+                    "defecto). Corra scripts/ejecutar_backtest_ipp.py para calibrar sobre el "
+                    "rolling-origin; no se usa la ruta con fuga de datos."
+                )
             self._normalizar_pesos()
 
         # Re-ajuste sobre la serie completa (pesos ya calibrados se conservan).

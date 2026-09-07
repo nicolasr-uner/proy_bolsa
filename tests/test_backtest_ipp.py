@@ -277,3 +277,41 @@ def test_lgb_drivers_pronostica_por_interfaz_forecast(df_ipp):
     assert len(fc) == 6
     assert np.isfinite(fc["pred"]).to_numpy().all(), "el LGB no produjo predicciones finitas"
     assert (fc["pred"] > 0).all(), "el IPP es un índice positivo"
+
+
+# ---------------------------------------------------------------------------
+# Regresión: la calibración de pesos con fuga de datos nunca corre en silencio
+# ---------------------------------------------------------------------------
+
+def test_fit_sin_backtest_no_usa_calibracion_con_fuga(df_ipp, monkeypatch):
+    """Sin `errores_backtest`, fit() NO debe invocar `_calibrar_pesos` (foresight perfecto).
+
+    Producción pasa df_val Y errores_backtest; si el parquet del backtest falta, errores_backtest
+    llega None y el código antiguo caía a la ruta con fuga en silencio (solo un warning),
+    reintroduciendo pesos calibrados con el futuro real. Por defecto eso no debe pasar.
+    """
+    from proybolsa.models.ipp.modelo_ipp import EnsembleIPP
+
+    llamado = {"leaky": False}
+    monkeypatch.setattr(EnsembleIPP, "_calibrar_pesos",
+                        lambda self, df_val: llamado.__setitem__("leaky", True))
+    train, val = df_ipp.iloc[:110], df_ipp.iloc[110:125]
+
+    EnsembleIPP().fit(train, df_val=val, errores_backtest=None)
+
+    assert not llamado["leaky"], "fit() usó la calibración con fuga sin backtest ni opt-in"
+
+
+def test_fit_con_opt_in_explicito_si_permite_calibracion_con_fuga(df_ipp, monkeypatch):
+    """La ruta con fuga sigue disponible SOLO si se pide explícitamente (experimentos locales)."""
+    from proybolsa.models.ipp.modelo_ipp import EnsembleIPP
+
+    llamado = {"leaky": False}
+    monkeypatch.setattr(EnsembleIPP, "_calibrar_pesos",
+                        lambda self, df_val: llamado.__setitem__("leaky", True))
+    train, val = df_ipp.iloc[:110], df_ipp.iloc[110:125]
+
+    EnsembleIPP().fit(train, df_val=val, errores_backtest=None,
+                      permitir_calibracion_con_fuga=True)
+
+    assert llamado["leaky"], "el opt-in explícito debe permitir la calibración antigua"
