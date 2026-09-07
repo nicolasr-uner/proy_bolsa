@@ -2,15 +2,19 @@
 
 Pipeline:
   1. SARIMA univariado (baseline robusto)
-  2. SARIMAX con drivers macro (TRM, Brent, PPI USA con rezagos)
-  3. VECM si hay cointegración Johansen entre IPP y drivers
+  2. SARIMAX con drivers ortogonales (brent_yoy, trm_yoy con rezagos, ENSO, estacionalidad)
+  3. VECM si hay cointegración Johansen entre IPP y brent_cop (sistema 2-variable)
   4. LightGBM sobre features tabulares
-  5. Ensemble por inverse-MSE sobre período de validación
+  5. Ensemble por inverse-MSE con shrinkage sobre los errores del rolling-origin, por horizonte
 
 El IPP colombiano tiene:
   - Estacionalidad débil (la manufactura no es tan estacional como el precio de bolsa)
-  - Cointegración de largo plazo con TRM y PPI internacional (literatura BanRep)
+  - Cointegración de largo plazo con el costo del insumo importado en pesos (literatura BanRep)
   - Rezago típico de 1-3 meses (transmisión importaciones -> precios internos)
+
+Drivers (post-estudio; ver docs/estudio_drivers_ipp.md y docs/METODOLOGIA.md):
+  brent_cop = Brent_USD x TRM (costo importado en pesos, VIF~=1.04) y las variaciones
+  anuales brent_yoy / trm_yoy. PPI USA se descartó por multicolinealidad (VIF=7.65).
 
 Nota: Requiere ipp > 0 (índice base=100, DANE dic-2014). El modelo trabaja en
 diferencias logarítmicas (log_dif) para estacionariedad y el pronóstico se
