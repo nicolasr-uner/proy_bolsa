@@ -853,7 +853,11 @@ with tab_precision:
     _bt = pd.read_parquet(_bt_path) if _bt_path.exists() else pd.DataFrame()
     if not _bt.empty:
         st.markdown("**Historico (backtest rolling-origin) — RMSE por horizonte**")
-        _vista = _bt[_bt["n_suficiente"]] if "n_suficiente" in _bt.columns else _bt
+        _vista = _bt.copy()
+        if "modo_drivers" in _vista.columns:
+            _vista = _vista[_vista["modo_drivers"] == "congelado"]
+        if "n_suficiente" in _vista.columns:
+            _vista = _vista[_vista["n_suficiente"]]
         st.dataframe(
             _vista.pivot_table(index="modelo", columns="horizonte", values="rmse").round(2),
             use_container_width=True,
