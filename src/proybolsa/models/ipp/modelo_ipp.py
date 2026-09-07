@@ -412,12 +412,21 @@ class VECMDriversIPP:
             return self._desactivar(decision["motivo"], estimar_igual=True,
                                     data_log=data_log, k=k)
 
-        # 4. Estimar con EL MISMO k que se testeó.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            modelo = VECM(data_log.values, k_ar_diff=k,
-                          coint_rank=decision["rango"], deterministic="ci")
-            ajustado = modelo.fit()
+        # 4. Estimar con EL MISMO k que se testeó. La MLE del VECM puede toparse con una
+        # matriz singular (p.ej. muestras cortas o drivers casi colineales) aunque Johansen
+        # haya dado luz verde; eso es una falla numerica del ajuste, no un motivo de diseño,
+        # asi que se degrada igual que un Johansen negativo en vez de tumbar el panel entero.
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                modelo = VECM(data_log.values, k_ar_diff=k,
+                              coint_rank=decision["rango"], deterministic="ci")
+                ajustado = modelo.fit()
+        except (np.linalg.LinAlgError, ValueError) as exc:
+            return self._desactivar(
+                f"Johansen dio cointegracion pero la MLE no convergio ({exc})",
+                estimar_igual=True, data_log=data_log, k=k,
+            )
 
         # 5. El término de corrección de error debe tirar del IPP hacia el equilibrio.
         if self.exigir_alpha_negativo:
