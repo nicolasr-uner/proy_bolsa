@@ -553,6 +553,27 @@ class LGBDriversIPP:
                 X[c] = -9999
         return np.exp(self._model.predict(X[self._feature_cols]))
 
+    def forecast(self, horizon: int, exog_future: pd.DataFrame | None = None) -> pd.DataFrame:
+        """Interfaz uniforme del backtest: nivel del IPP sobre los drivers futuros.
+
+        Los demás componentes exponen `forecast(horizon, exog_future) -> DataFrame`; el LGB solo
+        tenía `predict(df)`, así que el backtest (`_llamar_forecast`) le pasaba el horizonte como
+        si fuera el DataFrame de features y quedaba en NaN. LGB no tiene banda nativa (la del
+        ensemble sale del calibrador empírico), así que `ci_lo90`/`ci_hi90` van en NaN como en el
+        resto de componentes sin intervalo propio.
+        """
+        if exog_future is None or len(exog_future) == 0:
+            preds = np.full(horizon, np.nan)
+        else:
+            preds = np.asarray(self.predict(exog_future), dtype=float)[:horizon]
+            if len(preds) < horizon:
+                preds = np.concatenate([preds, np.full(horizon - len(preds), np.nan)])
+        return pd.DataFrame({
+            "pred": preds,
+            "ci_lo90": np.full(horizon, np.nan),
+            "ci_hi90": np.full(horizon, np.nan),
+        })
+
 
 # ---------------------------------------------------------------------------
 # Ensemble IPP

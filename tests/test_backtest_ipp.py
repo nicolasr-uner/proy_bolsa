@@ -252,3 +252,28 @@ def test_el_error_crece_con_el_horizonte(df_ipp):
     _, met = backtest_ipp(df_ipp, ["ipp_bench_rw"], horizontes=(1, 12), min_train=80, step=5)
     r = met.set_index("horizonte")["rmse"]
     assert r.loc[12] > r.loc[1], "el error a 12 meses debe superar al de 1 mes"
+
+
+# ---------------------------------------------------------------------------
+# Regresión: el LGB de drivers debe pronosticar por la interfaz del backtest
+# ---------------------------------------------------------------------------
+
+def test_lgb_drivers_pronostica_por_interfaz_forecast(df_ipp):
+    """LGBDriversIPP debe dar predicciones válidas vía forecast(horizon, exog_future).
+
+    Regresión: solo tenía predict(df), así que _llamar_forecast caía al branch fn(horizon)
+    y le pasaba un int donde esperaba un DataFrame -> AttributeError -> 0 predicciones
+    válidas en el backtest. Su peso ~0.02 en producción era ese bug, no un juicio de precisión.
+    """
+    from proybolsa.backtest.ipp_mensual import _llamar_forecast
+    from proybolsa.models.ipp.modelo_ipp import LGBDriversIPP
+
+    train, futuro = df_ipp.iloc[:120], df_ipp.iloc[120:126].reset_index(drop=True)
+    modelo = LGBDriversIPP().fit(train)
+
+    fc = _llamar_forecast(modelo, 6, futuro)
+
+    assert list(fc.columns) == ["pred", "ci_lo90", "ci_hi90"]
+    assert len(fc) == 6
+    assert np.isfinite(fc["pred"]).to_numpy().all(), "el LGB no produjo predicciones finitas"
+    assert (fc["pred"] > 0).all(), "el IPP es un índice positivo"
