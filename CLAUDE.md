@@ -159,29 +159,39 @@ El loop mensual NO emite alertas automáticas (se diseñó para ser explícito).
 | `data/processed/ipp_features_mensual.parquet` | 137 meses × 34 cols | Manual (DANE) |
 | `data/raw/macro/ipp_manual.csv` | Serie IPP cruda DANE | Manual mensual |
 
-## Resultados del backtest (junio 2026)
+## Estado actual del modelo (2026-09)
 
-| Horizonte | RMSE ensemble | RMSE naive | Sesgo |
-|-----------|:---:|:---:|:---:|
-| 1d  | 352 COP/kWh | 271 | +62 |
-| 7d  | 359 | 271 | +107 |
-| 14d | 496 | 321 | +130 |
-| 30d | 844 | 348 | +262 |
+> Ver **`docs/MANUAL.md`** (operación) y **`docs/METODOLOGIA.md`** (teoría + desempeño medido).
 
-El sesgo positivo es esperado: el modelo fue entrenado mayormente con datos de
-El Niño 2023-2024 (precios ~800–2000 COP/kWh) y el período de test es post-Niño
-(~465 COP/kWh). El loop mensual corrige el sesgo via `actualizar_sesgo()`.
+**Qué se despliega hoy:**
+- **IPP:** el pronóstico oficial es **`arima_drift`** (estrategia "campeón por horizonte":
+  `EnsembleIPP.fijar_pesos_campeon`, default en `PronosticadorIPP.fit`). Medido: el ensemble
+  ponderado pierde contra `arima_drift` en todo horizonte, así que se dejó de desplegar. El
+  VECM/SARIMAX/LGB quedan para escenarios. El **torneo** (`src/proybolsa/torneo/`) mide el panel
+  completo en vivo y el campeón se auto-adapta si otro gana.
+- **Bolsa:** ensemble SARIMAX+LGB con pesos **recalibrados honestos (~0.38 / 0.62)**. El 0.02/0.98
+  anterior era un artefacto (la calibración premiaba al LGB por persistir con el precio real del
+  futuro); ahora congela los lags de precio como en despliegue (`COLS_LAG_PRECIO`).
 
-## Pesos del ensemble (junio 2026)
+**Backtest honesto (evalúa el modelo desplegado) — RMSE COP/kWh:**
 
-- SARIMAX: 4%, LGB: 96%, AIC SARIMAX: -739.2
-- Top features LGB: `precio_bolsa_mean_lag1d` (gain 4415), `lag7d` (456), `aportes_pct_lag1d` (448)
+| Horizonte | RMSE bolsa (ensemble) | RMSE naive |
+|-----------|:---:|:---:|
+| 1d  | 330 | 277 |
+| 7d  | 304 | 271 |
+| 14d | 396 | 319 |
+| 30d | 683 | 353 |
+
+Lectura honesta: el ensemble de bolsa ~empata/pierde contra el naive (Diebold-Mariano no
+significativo); el IPP/arima_drift le gana al drift. Cada corrida publica `skill_vs_naive` por
+horizonte en `resumen_bolsa.json` / `resumen_ipp.json`. El sesgo (transición El Niño→post-Niño)
+lo corrige el loop mensual vía `actualizar_sesgo()`.
 
 ## Tests
 
 ```powershell
 .venv\Scripts\python -m pytest tests/ -v
-# 108 passed
+# 211 passed, 2 skipped
 ```
 
 ## Notas de diseño importantes
@@ -190,15 +200,23 @@ El Niño 2023-2024 (precios ~800–2000 COP/kWh) y el período de test es post-N
    invertirse de signo entre entrenamiento y despliegue. Se actualiza desde el loop
    mensual vía `modelo.modelo.actualizar_sesgo({horizonte: sesgo_cop})`.
 
-2. **Bandas de incertidumbre**: el ancho del CI viene de SARIMAX en log-espacio,
-   centrado sobre la predicción del ensemble. Garantiza CI siempre mayor al punto.
+2. **Bandas de incertidumbre**: en **bolsa**, el ancho del CI viene de SARIMAX en log-espacio,
+   centrado sobre la predicción (heurístico). En **IPP** las bandas se calibran empíricamente
+   sobre los errores del backtest (`incertidumbre.py`, cuantiles por horizonte), no se heredan
+   de un componente.
 
 3. **Data leak en backtest**: para h > 1, `_fix_lags_precio()` fija los lags del
    precio en el último valor de entrenamiento (evita que LGB vea el futuro).
 
 4. **VECM en IPP**: sistema de 2 variables `{ipp, brent_cop}`. Activado solo si
-   Johansen detecta cointegración. Con histórico corto puede no estar disponible →
-   degradación elegante (`_available=False`, peso=0 en ensemble).
+   Johansen detecta cointegración; degrada elegante si no (`_available=False`, o si la MLE
+   es singular pese a Johansen). **Nota:** el pronóstico oficial del IPP ya no usa los pesos
+   del ensemble sino el **campeón** (`arima_drift`); el VECM se usa en el **modo escenario**
+   (sensibilidad a drivers), no para el punto.
+
+9. **Validación Pandera**: `construir_features` valida los datos crudos (precio horario,
+   demanda, ONI, hidrología, macro, IPP) contra `validate/schemas.py` y **lanza** ante datos
+   inválidos. Ya no es código muerto.
 
 5. **BanRep SDMX bloqueado**: `load_ipp_local()` es el método requerido para IPP.
    La función `cargar_ipp_banrep_sdmx()` existe pero falla en el entorno actual.
