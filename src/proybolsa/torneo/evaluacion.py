@@ -49,3 +49,43 @@ def agregar_leaderboard(resueltos_df: pd.DataFrame,
         axis=1,
     )
     return lb
+
+
+def skill_acumulado(resueltos_df: pd.DataFrame, horizonte: int,
+                    naive: str = "ipp_bench_drift") -> pd.DataFrame:
+    """Skill acumulado vs. naive por modelo, a medida que los pronosticos del horizonte vencen.
+
+    Para cada modelo (excepto el naive), en cada fecha objetivo ya resuelta, calcula el RMSE
+    acumulado (sobre todo lo vencido hasta esa fecha) y lo compara con el RMSE acumulado del
+    naive: skill = 1 - rmse_modelo / rmse_naive. Es la vista "carrera de caballos" en el tiempo.
+
+    Devuelve filas [fecha_objetivo, modelo, skill]. Vacio si no hay datos o falta el naive.
+    """
+    cols = ["fecha_objetivo", "modelo", "skill"]
+    if resueltos_df is None or resueltos_df.empty or "horizonte" not in resueltos_df.columns:
+        return pd.DataFrame(columns=cols)
+
+    r = resueltos_df[resueltos_df["horizonte"] == horizonte].copy()
+    if r.empty or naive not in set(r["modelo"]):
+        return pd.DataFrame(columns=cols)
+    r["fecha_objetivo"] = pd.to_datetime(r["fecha_objetivo"])
+    r = r.sort_values("fecha_objetivo")
+
+    def _rmse_acum(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("fecha_objetivo")
+        rmse = ((g["error"] ** 2).expanding().mean()) ** 0.5
+        return pd.Series(rmse.to_numpy(), index=g["fecha_objetivo"].to_numpy())
+
+    rmse_naive = _rmse_acum(r[r["modelo"] == naive])
+
+    filas = []
+    for mod, g in r.groupby("modelo"):
+        if mod == naive:
+            continue
+        rmse_mod = _rmse_acum(g)
+        for fecha, rm in rmse_mod.items():
+            rn = rmse_naive.get(fecha)
+            if rn is not None and rn > 0:
+                filas.append({"fecha_objetivo": fecha, "modelo": mod,
+                              "skill": float(1 - rm / rn)})
+    return pd.DataFrame(filas, columns=cols)

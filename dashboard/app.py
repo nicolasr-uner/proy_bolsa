@@ -862,3 +862,46 @@ with tab_precision:
             _vista.pivot_table(index="modelo", columns="horizonte", values="rmse").round(2),
             use_container_width=True,
         )
+
+    # -----------------------------------------------------------------------
+    # Torneo: evolucion del skill en el tiempo (spec §7)
+    # -----------------------------------------------------------------------
+    from proybolsa.torneo.evaluacion import skill_acumulado as _skill_acum
+
+    st.markdown("---")
+    st.subheader("Evolucion del skill en el tiempo")
+    st.caption(
+        "Skill acumulado vs. naive (drift) a medida que cada pronostico vence. Positivo = le "
+        "gana al naive. Se construye desde outputs/torneo/resueltos_ipp.parquet."
+    )
+    _res_path = _OUT_TORNEO / "torneo" / "resueltos_ipp.parquet"
+    _res = pd.read_parquet(_res_path) if _res_path.exists() else pd.DataFrame()
+    if _res.empty or "ipp_bench_drift" not in set(_res.get("modelo", [])):
+        st.info(
+            "Aun no hay pronosticos IPP vencidos suficientes para la evolucion del skill. "
+            "Aparecera a medida que los ciclos mensuales acumulen resultados."
+        )
+    else:
+        _hs = sorted(int(h) for h in _res["horizonte"].unique())
+        _h_sel = st.selectbox("Horizonte (meses)", _hs,
+                              index=_hs.index(12) if 12 in _hs else 0)
+        _sk = _skill_acum(_res, horizonte=_h_sel, naive="ipp_bench_drift")
+        if _sk.empty:
+            st.info("Sin datos suficientes para ese horizonte todavia.")
+        else:
+            _figsk = go.Figure()
+            for _mod in sorted(_sk["modelo"].unique()):
+                _g = _sk[_sk["modelo"] == _mod]
+                _figsk.add_trace(go.Scatter(
+                    x=_g["fecha_objetivo"], y=_g["skill"],
+                    mode="lines+markers", name=_mod,
+                ))
+            _figsk.add_hline(y=0, line_dash="dash", line_color="gray",
+                             annotation_text="naive (drift)")
+            _figsk.update_layout(
+                title=f"Skill acumulado vs naive — horizonte {_h_sel}m",
+                yaxis_title="skill (1 - RMSE/RMSE_naive)", xaxis_title="fecha objetivo",
+                hovermode="x unified", height=380,
+                legend={"orientation": "h", "y": -0.25},
+            )
+            st.plotly_chart(_figsk, use_container_width=True)

@@ -34,3 +34,23 @@ def test_leaderboard_skill_vs_naive():
     assert fila["rmse"] == 1.0
     assert fila["skill_vs_naive"] == 0.5
     assert fila["n_resueltos"] == 1
+
+
+def test_skill_acumulado_positivo_para_el_mejor():
+    from proybolsa.torneo.evaluacion import skill_acumulado
+    fechas = pd.date_range("2026-01-01", periods=6, freq="MS")
+    filas = []
+    for f in fechas:
+        filas.append({"fecha_objetivo": f, "modelo": "ipp_arima_drift", "horizonte": 12, "error": 1.0})
+        filas.append({"fecha_objetivo": f, "modelo": "ipp_bench_drift", "horizonte": 12, "error": 2.0})
+    sk = skill_acumulado(pd.DataFrame(filas), horizonte=12, naive="ipp_bench_drift")
+    ad = sk[sk["modelo"] == "ipp_arima_drift"]
+    assert len(ad) == 6
+    assert np.allclose(ad["skill"], 0.5)  # rmse_acum 1 vs naive 2 -> skill 0.5
+    assert "ipp_bench_drift" not in set(sk["modelo"])  # el naive es la referencia, no una serie
+    assert list(sk.columns) == ["fecha_objetivo", "modelo", "skill"]
+
+
+def test_skill_acumulado_vacio_no_crashea():
+    from proybolsa.torneo.evaluacion import skill_acumulado
+    assert skill_acumulado(pd.DataFrame(), horizonte=12).empty
