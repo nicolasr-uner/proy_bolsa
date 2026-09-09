@@ -26,6 +26,7 @@ warnings.filterwarnings("ignore")
 
 from proybolsa.backtest.rolling_origin import RollingOriginBacktest, diebold_mariano
 from proybolsa.models.bolsa import EnsembleNivel, PronosticadorBolsa
+from proybolsa.models.bolsa.nivel_diario import COLS_LAG_PRECIO
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,13 +44,6 @@ OUTPUTS = ROOT / "outputs" / "backtest"
 # Wrappers fit/predict para RollingOriginBacktest
 # ---------------------------------------------------------------------------
 
-_COLS_PRECIO_LAG = [
-    "precio_bolsa_mean_lag1d", "precio_bolsa_mean_lag7d", "precio_bolsa_mean_lag30d",
-    "precio_bolsa_mean_roll7d_mean", "precio_bolsa_mean_roll30d_mean",
-    "precio_bolsa_mean_roll7d_std",  "precio_bolsa_mean_roll30d_std",
-]
-
-
 def _fix_lags_precio(df_test: pd.DataFrame, df_train: pd.DataFrame) -> pd.DataFrame:
     """Reemplaza los lags de precio en df_test con los valores del ultimo dia de train.
 
@@ -57,15 +51,23 @@ def _fix_lags_precio(df_test: pd.DataFrame, df_train: pd.DataFrame) -> pd.DataFr
     (random-walk assumption para los lags). Esto evita el data leak precio futuro -> feature.
     """
     df = df_test.copy()
-    for col in _COLS_PRECIO_LAG:
+    for col in COLS_LAG_PRECIO:
         if col in df.columns and col in df_train.columns:
             df[col] = df_train[col].iloc[-1]
     return df
 
 
 def _fit_ensemble(df_train: pd.DataFrame) -> dict:
+    # Calibrar con un split interno: mismo protocolo que produccion (EnsembleNivel.fit
+    # con df_val calibra pesos con los lags de precio congelados, ver nivel_diario.py).
+    # Sin esto, el backtest evaluaba un ensemble con pesos 50/50 por defecto, distinto
+    # al desplegado (que calibra y termina ~98/2 sin el fix, o el valor calibrado justo
+    # con el fix).
+    n_val = max(30, int(len(df_train) * 0.1))
+    inner_train = df_train.iloc[:-n_val]
+    inner_val = df_train.iloc[-n_val:]
     modelo = EnsembleNivel()
-    modelo.fit(df_train, df_val=None)
+    modelo.fit(inner_train, df_val=inner_val, df_full=df_train)
     return {"modelo": modelo, "df_train": df_train}
 
 
