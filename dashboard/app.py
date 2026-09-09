@@ -801,19 +801,27 @@ with tab_precision:
         )
         st.plotly_chart(fig_pesos, use_container_width=True)
 
-    st.subheader("Referencia: Backtest rolling-origin (62 origenes)")
-    st.markdown("""
-    | Horizonte | RMSE ensemble | RMSE naive | Sesgo |
-    |-----------|:---:|:---:|:---:|
-    | 1d  | 352 | 271 | +62  |
-    | 7d  | 359 | 271 | +107 |
-    | 14d | 496 | 321 | +130 |
-    | 30d | 844 | 348 | +262 |
-
-    > **Nota:** El sesgo positivo refleja la transicion del regimen El Nino 2023-2024
-    > (precio ~800-2000 COP/kWh) al periodo post-Nino 2025-2026 (~465 COP/kWh).
-    > El loop mensual lo corrige gradualmente via `actualizar_sesgo()`.
-    """)
+    st.subheader("Referencia: Backtest rolling-origin de bolsa")
+    _bt_bolsa = Path(__file__).resolve().parent.parent / "outputs" / "backtest" / "metricas_resumen.parquet"
+    if _bt_bolsa.exists():
+        _btb = pd.read_parquet(_bt_bolsa)
+        _n_orig = int(_btb["n_predicciones"].max()) if "n_predicciones" in _btb.columns else None
+        st.caption(
+            "RMSE (COP/kWh) por horizonte y modelo, leido del backtest regenerado (no hardcodeado)."
+            + (f" {_n_orig} origenes." if _n_orig else "")
+        )
+        st.dataframe(
+            _btb.pivot_table(index="modelo", columns="horizonte", values="rmse").round(0),
+            use_container_width=True,
+        )
+        st.markdown(
+            "> El ensemble recalibrado (pesos honestos, no el artefacto 98/2) mejora sobre el "
+            "50/50 pero aun **~empata al naive** (sin diferencia significativa por "
+            "Diebold-Mariano). El sesgo de la transicion El Nino 2023-2024 -> post-Nino lo "
+            "corrige el loop mensual via `actualizar_sesgo()`."
+        )
+    else:
+        st.info("Backtest de bolsa no disponible. Corra `scripts/ejecutar_backtest.py`.")
 
     # -----------------------------------------------------------------------
     # Torneo de modelos IPP: leaderboard (historico backtest + track record real)
