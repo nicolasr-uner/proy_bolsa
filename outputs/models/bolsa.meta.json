@@ -1,6 +1,6 @@
 {
   "modelo": "bolsa",
-  "fecha_serializacion": "2026-08-12T02:45:14+00:00",
+  "fecha_serializacion": "2026-09-09T16:56:36+00:00",
   "python": "3.12.13",
   "pandas": "2.2.3",
   "numpy": "2.1.3",
@@ -19,8 +19,8 @@
     }
   ],
   "resumen": {
-    "w_sarimax": 0.02,
-    "w_lgb": 0.98,
+    "w_sarimax": 0.383,
+    "w_lgb": 0.617,
     "n_train": 1316,
     "perfil_celdas": 864,
     "aic_sarimax": -929.8,
