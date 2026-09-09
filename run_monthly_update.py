@@ -199,6 +199,14 @@ def ciclo_bolsa(run_dir: Path, fecha_corte: str | None = None) -> None:
     resumen["errores_ciclo_anterior"] = errores_ciclo
     resumen["sesgo_aplicado"] = sesgo_reciente
     resumen["fecha_run"] = hoy
+    # Skill vs naive del backtest: cada corrida dice, sin adornos, si el modelo desplegado
+    # le gana a "no hacer casi nada" (positivo) o no (negativo).
+    try:
+        from proybolsa.backtest.rolling_origin import skill_vs_naive_por_horizonte
+        _met_b = pd.read_parquet(OUTPUTS / "backtest" / "metricas_resumen.parquet")
+        resumen["skill_vs_naive"] = skill_vs_naive_por_horizonte(_met_b, "ensemble", "naive")
+    except Exception:
+        logger.warning("  No se pudo calcular skill_vs_naive (bolsa)")
     with open(run_dir / "resumen_bolsa.json", "w") as f:
         json.dump(resumen, f, indent=2, default=str)
 
@@ -248,6 +256,18 @@ def ciclo_ipp(run_dir: Path, fecha_corte: str | None = None) -> None:
 
     resumen = modelo.resumen_modelo()
     resumen["fecha_run"] = hoy
+    # Skill vs naive del backtest para el modelo desplegado (campeon = arima_drift).
+    try:
+        from proybolsa.backtest.rolling_origin import skill_vs_naive_por_horizonte
+        _met_i = pd.read_parquet(OUTPUTS / "backtest" / "metricas_ipp.parquet")
+        if "muestra" in _met_i.columns:
+            _met_i = _met_i[_met_i["muestra"] == "corta"]
+        if "modo_drivers" in _met_i.columns:
+            _met_i = _met_i[_met_i["modo_drivers"] == "congelado"]
+        resumen["skill_vs_naive"] = skill_vs_naive_por_horizonte(
+            _met_i, "ipp_arima_drift", "ipp_bench_drift")
+    except Exception:
+        logger.warning("  No se pudo calcular skill_vs_naive (IPP)")
     with open(run_dir / "resumen_ipp.json", "w") as f:
         json.dump(resumen, f, indent=2, default=str)
 

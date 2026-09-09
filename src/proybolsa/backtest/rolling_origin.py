@@ -377,3 +377,26 @@ class RollingOriginBacktest:
         errores_df = pd.DataFrame(errores)
         metricas = calcular_metricas(errores_df)
         return errores_df, metricas
+
+
+def skill_vs_naive_por_horizonte(metricas: pd.DataFrame, modelo: str, naive: str,
+                                 col_modelo: str = "modelo", col_h: str = "horizonte",
+                                 col_rmse: str = "rmse") -> dict:
+    """Skill score (1 - RMSE_modelo/RMSE_naive) por horizonte, desde las metricas del backtest.
+
+    Positivo = el modelo le gana al naive; 0 = empata; negativo = pierde. Se publica en los
+    resumen_*.json del ciclo mensual para que cada corrida diga, sin adornos, si el modelo
+    desplegado supera a "no hacer casi nada". Devuelve {horizonte: skill_redondeado}.
+    """
+    if metricas is None or metricas.empty:
+        return {}
+    req = {col_modelo, col_h, col_rmse}
+    if not req <= set(metricas.columns):
+        return {}
+    rmse_m = metricas[metricas[col_modelo] == modelo].set_index(col_h)[col_rmse]
+    rmse_n = metricas[metricas[col_modelo] == naive].set_index(col_h)[col_rmse]
+    out: dict[int, float] = {}
+    for h in rmse_m.index:
+        if h in rmse_n.index and float(rmse_n[h]) > 0:
+            out[int(h)] = round(float(1 - float(rmse_m[h]) / float(rmse_n[h])), 3)
+    return out
