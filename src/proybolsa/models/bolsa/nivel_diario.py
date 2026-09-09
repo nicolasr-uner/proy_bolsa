@@ -64,6 +64,15 @@ _FEATS_LGB = [
     "precio_bolsa_mean_roll7d_std", "precio_bolsa_mean_roll30d_std",
 ]
 
+# Lags/rolling del precio: en produccion no se conoce el precio futuro, se congelan al
+# ultimo valor observado. La calibracion de pesos DEBE usar el mismo protocolo, si no el
+# LGB "gana" haciendo persistencia con el precio real del futuro (artefacto de pesos).
+COLS_LAG_PRECIO = [
+    "precio_bolsa_mean_lag1d", "precio_bolsa_mean_lag7d", "precio_bolsa_mean_lag30d",
+    "precio_bolsa_mean_roll7d_mean", "precio_bolsa_mean_roll30d_mean",
+    "precio_bolsa_mean_roll7d_std", "precio_bolsa_mean_roll30d_std",
+]
+
 _SARIMAX_ORDER = (1, 1, 1)
 _SARIMAX_SEAS = (1, 0, 1, 7)   # ciclo semanal (precios colombianos tienen patron dia)
 
@@ -282,7 +291,7 @@ class EnsembleNivel:
         self.lgb.fit(df_train)
 
         if df_val is not None and len(df_val) > 0:
-            self._calibrar_pesos(df_val)
+            self._calibrar_pesos(df_val, df_train)
 
         if df_full is not None and len(df_full) > len(df_train):
             self.sarimax.fit(df_full)
@@ -301,16 +310,31 @@ class EnsembleNivel:
         self.sesgo_por_horizonte.update(sesgo)
         logger.info("Sesgos actualizados: %s", {k: f"{v:+.1f}" for k, v in self.sesgo_por_horizonte.items()})
 
-    def _calibrar_pesos(self, df_val: pd.DataFrame) -> None:
-        """Pesos inverse-MSE sobre el conjunto de validacion."""
+    def _calibrar_pesos(self, df_val: pd.DataFrame, df_train: pd.DataFrame) -> None:
+        """Pesos inverse-MSE sobre el conjunto de validacion.
+
+        Importante: `df_val` trae los lags de precio REALES de cada dia de validacion
+        (precio_bolsa_mean_lag1d, etc.), que en produccion NO se conocen (el pronostico
+        parte del ultimo dato observado y esos lags se congelan, ver `_fix_lags_precio`
+        en scripts/ejecutar_backtest.py). Si se los dejamos pasar tal cual al LGB, este
+        hace persistencia con el precio verdadero del futuro -> MSE artificialmente
+        bajo -> "gana" el inverse-MSE con w_lgb≈0.98, una ventaja que no existe en
+        despliegue. Para calibrar de forma justa, congelamos esos lags al ultimo valor
+        de `df_train` -- el mismo protocolo que se usa en produccion y en el backtest.
+        """
         y_real = df_val["precio_bolsa_mean"].values
 
         # Predicciones SARIMAX en val (se pasan los exog del periodo de validacion)
         pred_sar = self.sarimax.forecast(len(df_val), exog_future=df_val)["pred"].values
         mse_sar = np.mean((y_real - pred_sar) ** 2)
 
-        # Predicciones LGB en val
-        pred_lgb = self.lgb.predict(df_val)
+        # Predicciones LGB en val, con los lags de precio congelados al ultimo valor
+        # conocido de train (protocolo de despliegue, evita el artefacto de pesos).
+        df_val_congelado = df_val.copy()
+        for col in COLS_LAG_PRECIO:
+            if col in df_val_congelado.columns and col in df_train.columns:
+                df_val_congelado[col] = df_train[col].iloc[-1]
+        pred_lgb = self.lgb.predict(df_val_congelado)
         mse_lgb = np.mean((y_real - pred_lgb) ** 2)
 
         # Inverse-MSE weights (evitar division por cero)
