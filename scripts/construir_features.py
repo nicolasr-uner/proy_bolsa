@@ -37,6 +37,8 @@ from proybolsa.features.lags import (
     agregar_lags_mensuales,
     agregar_rolling,
 )
+from proybolsa.validate import schemas as _schemas
+import pandera as _pa
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -46,6 +48,27 @@ RAW_XM = ROOT / "data" / "raw" / "xm"
 RAW_MACRO = ROOT / "data" / "raw" / "macro"
 PROCESSED = ROOT / "data" / "processed"
 
+# Esquemas por nombre de fuente cruda (los que matchean 1-a-1 un parquet crudo).
+_ESQUEMAS_CRUDOS = {
+    "precio_bolsa_horario": _schemas.PRECIO_BOLSA_HORARIO,
+    "demanda_diaria": _schemas.DEMANDA_DIARIA,
+    "oni_mensual": _schemas.ONI_MENSUAL,
+}
+
+
+def _validar(df: pd.DataFrame, esquema: _pa.DataFrameSchema, nombre: str) -> pd.DataFrame:
+    """Valida df contra el esquema. Lanza con un mensaje claro si los datos son invalidos.
+
+    La validacion es real (lanza): el objetivo es cortar datos malos (precio negativo, rangos
+    imposibles, timestamps desordenados) antes de que entren al modelo, no solo documentarlos.
+    """
+    try:
+        esquema.validate(df, lazy=True)
+    except _pa.errors.SchemaErrors as exc:
+        logger.error("Validacion Pandera FALLO en '%s': datos invalidos.\n%s", nombre, exc)
+        raise
+    return df
+
 
 def _leer(ruta: Path, nombre: str) -> pd.DataFrame | None:
     if not ruta.exists():
@@ -53,6 +76,8 @@ def _leer(ruta: Path, nombre: str) -> pd.DataFrame | None:
         return None
     df = pd.read_parquet(ruta)
     logger.info("  Leido: %s (%d filas)", nombre, len(df))
+    if nombre in _ESQUEMAS_CRUDOS:
+        _validar(df, _ESQUEMAS_CRUDOS[nombre], nombre)
     return df
 
 
@@ -111,6 +136,7 @@ def construir_features_bolsa(incluir_perfil: bool = True) -> None:
     hidro = None
     if df_aportes is not None and df_embalses is not None:
         hidro = df_aportes.merge(df_embalses, on="fecha", how="outer")
+        _validar(hidro, _schemas.HIDROLOGIA_DIARIA, "hidrologia_diaria")
         hidro = escalar_fracciones(hidro)
         if df_vert is not None:
             hidro = hidro.merge(df_vert, on="fecha", how="left")
@@ -193,6 +219,9 @@ def construir_features_ipp() -> None:
                 "y volver a ejecutar. Solo se guardara el feature matrix de drivers macro."
             )
 
+    if df_ipp is not None and "ipp" in df_ipp.columns:
+        _validar(df_ipp[["fecha", "ipp"]], _schemas.IPP_MENSUAL, "ipp_mensual")
+
     # Macro drivers
     df_trm = _leer(RAW_MACRO / "trm_diaria.parquet", "trm_diaria")
     df_brent = _leer(RAW_MACRO / "brent_diario.parquet", "brent_diario")
@@ -223,6 +252,10 @@ def construir_features_ipp() -> None:
     for d in dfs_mensuales[1:]:
         macro = macro.merge(d, on="fecha", how="outer")
     macro = macro.sort_values("fecha").reset_index(drop=True)
+
+    _cols_macro = [c for c in ("fecha", "trm", "brent", "ppi_usa") if c in macro.columns]
+    if {"trm", "brent", "ppi_usa"} <= set(macro.columns):
+        _validar(macro[_cols_macro], _schemas.MACRO_MENSUAL, "macro_mensual")
 
     # Agregar mes (cyclical encoding)
     macro["mes"] = pd.to_datetime(macro["fecha"]).dt.month

@@ -89,7 +89,9 @@ DEMANDA_DIARIA = pa.DataFrameSchema(
 
 MACRO_MENSUAL = pa.DataFrameSchema(
     {
-        "fecha": pa.Column("object", nullable=False),
+        # Sin restriccion de dtype: acepta tanto "object" (date) como datetime64
+        # (la forma que trae el parquet ya procesado por construir_features.py).
+        "fecha": pa.Column(nullable=False),
         "trm": pa.Column(
             float,
             checks=[pa.Check.ge(1000), pa.Check.le(10000)],
@@ -118,12 +120,17 @@ MACRO_MENSUAL = pa.DataFrameSchema(
 
 IPP_MENSUAL = pa.DataFrameSchema(
     {
-        "fecha": pa.Column("object", nullable=False),
+        # Sin restriccion de dtype: acepta tanto "object" (date) como datetime64
+        # (la forma que trae el parquet ya procesado por construir_features.py).
+        "fecha": pa.Column(nullable=False),
         "ipp": pa.Column(
             float,
-            checks=[pa.Check.ge(50), pa.Check.le(500)],
+            # Piso 40: la serie real de DANE arranca en 1999-06 con ipp=49.29 (base dic-2014=100,
+            # el indice estaba ~49 en 1999). El piso original de 50 rechazaba ese dato legitimo.
+            # 40 acepta el minimo historico real con margen y aun corta basura (negativos, ceros).
+            checks=[pa.Check.ge(40), pa.Check.le(500)],
             nullable=False,
-            description="Indice IPP Oferta Interna, base dic-2014=100",
+            description="Indice IPP Oferta Interna, base dic-2014=100 (serie desde 1999, min ~49)",
         ),
     },
     name="ipp_mensual",
